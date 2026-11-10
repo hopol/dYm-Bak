@@ -1,0 +1,522 @@
+/// <reference path="./index.d.ts" />
+import { contextBridge, ipcRenderer } from 'electron'
+import { electronAPI } from '@electron-toolkit/preload'
+import type {
+  MigrationStatus,
+  PrunePreview,
+  StorageConfigInput,
+  StorageConfigView,
+  StorageQueueStats,
+  StorageTestResult
+} from '../shared/storage'
+import type {
+  AiModelInfo,
+  AiProviderInput,
+  AiProviderView,
+  AnalysisJobItemStatus,
+  AnalysisJobItemView,
+  AnalysisJobView,
+  AnalysisQueueEvent,
+  AnalysisSettings,
+  AsrProviderInput,
+  AsrProviderView,
+  CodexAuthStatus,
+  GrokAuthStatus,
+  OpenCodeCliKey,
+  CreateAnalysisJobInput
+} from '../shared/ai'
+import type { PostAnalysisDetail } from '../shared/analysis'
+
+const dbAPI = {
+  execute: (sql: string, params?: unknown[]): Promise<unknown> =>
+    ipcRenderer.invoke('db:execute', sql, params),
+  query: <T = unknown>(sql: string, params?: unknown[]): Promise<T[]> =>
+    ipcRenderer.invoke('db:query', sql, params),
+  queryOne: <T = unknown>(sql: string, params?: unknown[]): Promise<T | undefined> =>
+    ipcRenderer.invoke('db:queryOne', sql, params)
+}
+
+const settingsAPI = {
+  get: (key: string): Promise<string | null> => ipcRenderer.invoke('settings:get', key),
+  set: (key: string, value: string): Promise<void> =>
+    ipcRenderer.invoke('settings:set', key, value),
+  getAll: (): Promise<Record<string, string>> => ipcRenderer.invoke('settings:getAll'),
+  getDefaultDownloadPath: (): Promise<string> =>
+    ipcRenderer.invoke('settings:getDefaultDownloadPath')
+}
+
+const cookieAPI = {
+  fetchDouyin: (): Promise<string> => ipcRenderer.invoke('cookie:fetchDouyin'),
+  refreshSilent: (): Promise<string> => ipcRenderer.invoke('cookie:refreshSilent'),
+  isRefreshing: (): Promise<boolean> => ipcRenderer.invoke('cookie:isRefreshing'),
+  resetBrowser: (): Promise<void> => ipcRenderer.invoke('cookie:resetBrowser'),
+  fetchBilibili: (): Promise<string> => ipcRenderer.invoke('cookie:fetchBilibili'),
+  fetchKuaishou: (): Promise<string> => ipcRenderer.invoke('cookie:fetchKuaishou')
+}
+
+const douyinAPI = {
+  getUserProfile: (url: string): Promise<unknown> =>
+    ipcRenderer.invoke('douyin:getUserProfile', url),
+  getSecUserId: (url: string): Promise<string> => ipcRenderer.invoke('douyin:getSecUserId', url),
+  parseUrl: (url: string): Promise<{ type: 'user' | 'video' | 'unknown'; id: string }> =>
+    ipcRenderer.invoke('douyin:parseUrl', url)
+}
+
+const userAPI = {
+  getAll: (): Promise<DbUser[]> => ipcRenderer.invoke('user:getAll'),
+  add: (url: string, options?: AddCreatorOptions): Promise<AddUserResult> =>
+    ipcRenderer.invoke('user:add', url, options),
+  delete: (id: number, deleteFiles?: boolean): Promise<void> =>
+    ipcRenderer.invoke('user:delete', id, deleteFiles),
+  refresh: (id: number): Promise<DbUser> => ipcRenderer.invoke('user:refresh', id),
+  batchRefresh: (
+    users: { id: number; homepage_url: string; nickname: string }[]
+  ): Promise<{ success: number; failed: number; details: string[] }> =>
+    ipcRenderer.invoke('user:batchRefresh', users),
+  setShowInHome: (id: number, show: boolean): Promise<void> =>
+    ipcRenderer.invoke('user:setShowInHome', id, show),
+  updateSettings: (
+    id: number,
+    input: { show_in_home?: boolean; max_download_count?: number; remark?: string }
+  ): Promise<DbUser | undefined> => ipcRenderer.invoke('user:updateSettings', id, input),
+  batchUpdateSettings: (
+    ids: number[],
+    input: {
+      show_in_home?: boolean
+      max_download_count?: number
+      auto_sync?: boolean
+      sync_cron?: string
+    }
+  ): Promise<void> => ipcRenderer.invoke('user:batchUpdateSettings', ids, input),
+  onAddPostProgress: (callback: (progress: AddPostProgress) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: AddPostProgress): void =>
+      callback(progress)
+    ipcRenderer.on('user:addPostProgress', handler)
+    return () => ipcRenderer.removeListener('user:addPostProgress', handler)
+  }
+}
+
+const taskAPI = {
+  getAll: (): Promise<DbTaskWithUsers[]> => ipcRenderer.invoke('task:getAll'),
+  getById: (id: number): Promise<DbTaskWithUsers | undefined> =>
+    ipcRenderer.invoke('task:getById', id),
+  create: (input: CreateTaskInput): Promise<DbTaskWithUsers> =>
+    ipcRenderer.invoke('task:create', input),
+  update: (id: number, input: UpdateTaskInput): Promise<DbTaskWithUsers | undefined> =>
+    ipcRenderer.invoke('task:update', id, input),
+  updateUsers: (taskId: number, userIds: number[]): Promise<DbTaskWithUsers | undefined> =>
+    ipcRenderer.invoke('task:updateUsers', taskId, userIds),
+  updateSchedule: (taskId: number): Promise<void> =>
+    ipcRenderer.invoke('task:updateSchedule', taskId),
+  delete: (id: number): Promise<void> => ipcRenderer.invoke('task:delete', id)
+}
+
+const downloadAPI = {
+  start: (taskId: number): Promise<void> => ipcRenderer.invoke('download:start', taskId),
+  stop: (taskId: number): Promise<void> => ipcRenderer.invoke('download:stop', taskId),
+  isRunning: (taskId: number): Promise<boolean> => ipcRenderer.invoke('download:isRunning', taskId),
+  onProgress: (callback: (progress: DownloadProgress) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: DownloadProgress): void =>
+      callback(progress)
+    ipcRenderer.on('download:progress', handler)
+    return () => ipcRenderer.removeListener('download:progress', handler)
+  }
+}
+
+const syncAPI = {
+  start: (userId: number): Promise<void> => ipcRenderer.invoke('sync:start', userId),
+  stop: (userId: number): Promise<void> => ipcRenderer.invoke('sync:stop', userId),
+  isRunning: (userId: number): Promise<boolean> => ipcRenderer.invoke('sync:isRunning', userId),
+  getAnySyncing: (): Promise<number | null> => ipcRenderer.invoke('sync:getAnySyncing'),
+  getAllSyncing: (): Promise<number[]> => ipcRenderer.invoke('sync:getAllSyncing'),
+  validateCron: (expression: string): Promise<boolean> =>
+    ipcRenderer.invoke('sync:validateCron', expression),
+  updateUserSchedule: (userId: number): Promise<void> =>
+    ipcRenderer.invoke('sync:updateUserSchedule', userId),
+  onProgress: (callback: (progress: SyncProgress) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: SyncProgress): void =>
+      callback(progress)
+    ipcRenderer.on('sync:progress', handler)
+    return () => ipcRenderer.removeListener('sync:progress', handler)
+  }
+}
+
+const schedulerAPI = {
+  onLog: (callback: (log: SchedulerLog) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, log: SchedulerLog): void => callback(log)
+    ipcRenderer.on('scheduler:log', handler)
+    return () => ipcRenderer.removeListener('scheduler:log', handler)
+  },
+  getLogs: (): Promise<SchedulerLog[]> => ipcRenderer.invoke('scheduler:getLogs'),
+  clearLogs: (): Promise<void> => ipcRenderer.invoke('scheduler:clearLogs')
+}
+
+const collectAPI = {
+  reschedule: (): Promise<void> => ipcRenderer.invoke('collect:reschedule'),
+  syncNow: (): Promise<void> => ipcRenderer.invoke('collect:syncNow')
+}
+
+const liveAPI = {
+  isRecording: (userId: number): Promise<boolean> => ipcRenderer.invoke('live:isRecording', userId),
+  getRecordingUsers: (): Promise<number[]> => ipcRenderer.invoke('live:getRecordingUsers'),
+  getConvertingIds: (): Promise<number[]> => ipcRenderer.invoke('live:getConvertingIds'),
+  checkNow: (userId: number): Promise<boolean> => ipcRenderer.invoke('live:checkNow', userId),
+  stop: (userId: number): Promise<boolean> => ipcRenderer.invoke('live:stop', userId),
+  getRecords: (limit?: number): Promise<LiveRecord[]> =>
+    ipcRenderer.invoke('live:getRecords', limit),
+  preparePlayback: (id: number): Promise<LivePlaybackInfo> =>
+    ipcRenderer.invoke('live:preparePlayback', id),
+  getDanmaku: (id: number): Promise<DanmakuLine[]> => ipcRenderer.invoke('live:getDanmaku', id),
+  openPlayer: (id: number): Promise<void> => ipcRenderer.invoke('live:openPlayer', id),
+  deleteRecord: (id: number, deleteFiles?: boolean): Promise<DeleteLiveRecordsResult> =>
+    ipcRenderer.invoke('live:deleteRecord', id, deleteFiles),
+  deleteRecords: (ids: number[], deleteFiles?: boolean): Promise<DeleteLiveRecordsResult> =>
+    ipcRenderer.invoke('live:deleteRecords', ids, deleteFiles),
+  revealFile: (filePath: string): Promise<void> => ipcRenderer.invoke('live:revealFile', filePath),
+  updateUserSchedule: (userId: number): Promise<void> =>
+    ipcRenderer.invoke('live:updateUserSchedule', userId),
+  onProgress: (callback: (progress: LiveProgress) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: LiveProgress): void =>
+      callback(progress)
+    ipcRenderer.on('live:progress', handler)
+    return () => ipcRenderer.removeListener('live:progress', handler)
+  }
+}
+
+const postAPI = {
+  getAll: (
+    page?: number,
+    pageSize?: number,
+    filters?: PostFilters,
+    sort?: PostSortConfig
+  ): Promise<{ posts: DbPost[]; total: number; authors: PostAuthor[] }> =>
+    ipcRenderer.invoke('post:getAll', page, pageSize, filters, sort),
+  getAllTags: (): Promise<string[]> => ipcRenderer.invoke('post:getAllTags'),
+  getCoverPath: (secUid: string, folderName: string): Promise<string | null> =>
+    ipcRenderer.invoke('post:getCoverPath', secUid, folderName),
+  getMediaFiles: (
+    secUid: string,
+    folderName: string,
+    awemeType: number
+  ): Promise<MediaFiles | null> =>
+    ipcRenderer.invoke('post:getMediaFiles', secUid, folderName, awemeType),
+  openFolder: (secUid: string, folderName: string): Promise<void> =>
+    ipcRenderer.invoke('post:openFolder', secUid, folderName),
+  scanBroken: (): Promise<BrokenPostInfo[]> => ipcRenderer.invoke('post:scanBroken'),
+  redownload: (awemeId: string): Promise<{ success: boolean; message: string }> =>
+    ipcRenderer.invoke('post:redownload', awemeId),
+  batchRedownload: (awemeIds: string[]): Promise<{ success: number; failed: number }> =>
+    ipcRenderer.invoke('post:batchRedownload', awemeIds)
+}
+
+const aiAPI = {
+  listProviders: (): Promise<AiProviderView[]> => ipcRenderer.invoke('ai:listProviders'),
+  saveProvider: (input: AiProviderInput): Promise<AiProviderView> =>
+    ipcRenderer.invoke('ai:saveProvider', input),
+  deleteProvider: (id: string): Promise<void> => ipcRenderer.invoke('ai:deleteProvider', id),
+  setDefaultProvider: (id: string): Promise<void> =>
+    ipcRenderer.invoke('ai:setDefaultProvider', id),
+  verifyProvider: (input: AiProviderInput): Promise<{ ok: true; message: string }> =>
+    ipcRenderer.invoke('ai:verifyProvider', input),
+  listModels: (input: AiProviderInput): Promise<AiModelInfo[] | null> =>
+    ipcRenderer.invoke('ai:listModels', input),
+  codexStatus: (providerId: string): Promise<CodexAuthStatus> =>
+    ipcRenderer.invoke('ai:codexStatus', providerId),
+  codexLogin: (providerId: string): Promise<CodexAuthStatus> =>
+    ipcRenderer.invoke('ai:codexLogin', providerId),
+  codexCancelLogin: (): Promise<void> => ipcRenderer.invoke('ai:codexCancelLogin'),
+  codexImportFromCli: (providerId: string): Promise<CodexAuthStatus> =>
+    ipcRenderer.invoke('ai:codexImportFromCli', providerId),
+  codexLogout: (providerId: string): Promise<CodexAuthStatus> =>
+    ipcRenderer.invoke('ai:codexLogout', providerId),
+  opencodeCliKey: (baseUrl: string): Promise<OpenCodeCliKey | null> =>
+    ipcRenderer.invoke('ai:opencodeCliKey', baseUrl),
+  grokStatus: (providerId: string): Promise<GrokAuthStatus> =>
+    ipcRenderer.invoke('ai:grokStatus', providerId),
+  grokLogin: (providerId: string): Promise<GrokAuthStatus> =>
+    ipcRenderer.invoke('ai:grokLogin', providerId),
+  grokCancelLogin: (): Promise<void> => ipcRenderer.invoke('ai:grokCancelLogin'),
+  grokLogout: (providerId: string): Promise<GrokAuthStatus> =>
+    ipcRenderer.invoke('ai:grokLogout', providerId)
+}
+
+const asrAPI = {
+  listProviders: (): Promise<AsrProviderView[]> => ipcRenderer.invoke('asr:listProviders'),
+  saveProvider: (input: AsrProviderInput): Promise<AsrProviderView> =>
+    ipcRenderer.invoke('asr:saveProvider', input),
+  deleteProvider: (id: string): Promise<void> => ipcRenderer.invoke('asr:deleteProvider', id),
+  setDefaultProvider: (id: string): Promise<void> =>
+    ipcRenderer.invoke('asr:setDefaultProvider', id),
+  verifyProvider: (input: AsrProviderInput): Promise<{ ok: true; message: string }> =>
+    ipcRenderer.invoke('asr:verifyProvider', input)
+}
+
+const analysisAPI = {
+  getSettings: (): Promise<AnalysisSettings> => ipcRenderer.invoke('analysis:getSettings'),
+  getDetail: (postId: number): Promise<PostAnalysisDetail> =>
+    ipcRenderer.invoke('analysis:getDetail', postId),
+  searchTranscripts: (
+    keyword: string,
+    limit?: number
+  ): Promise<{ postId: number; snippet: string }[]> =>
+    ipcRenderer.invoke('analysis:searchTranscripts', keyword, limit),
+  saveSettings: (patch: Partial<AnalysisSettings>): Promise<AnalysisSettings> =>
+    ipcRenderer.invoke('analysis:saveSettings', patch),
+  createJob: (input: CreateAnalysisJobInput): Promise<AnalysisJobView> =>
+    ipcRenderer.invoke('analysis:createJob', input),
+  listJobs: (): Promise<AnalysisJobView[]> => ipcRenderer.invoke('analysis:listJobs'),
+  getJob: (id: number): Promise<AnalysisJobView | null> =>
+    ipcRenderer.invoke('analysis:getJob', id),
+  getJobItems: (
+    id: number,
+    filter?: { status?: AnalysisJobItemStatus; page?: number; pageSize?: number }
+  ): Promise<{ items: AnalysisJobItemView[]; total: number }> =>
+    ipcRenderer.invoke('analysis:getJobItems', id, filter),
+  pauseJob: (id: number): Promise<void> => ipcRenderer.invoke('analysis:pauseJob', id),
+  resumeJob: (id: number): Promise<void> => ipcRenderer.invoke('analysis:resumeJob', id),
+  cancelJob: (id: number): Promise<void> => ipcRenderer.invoke('analysis:cancelJob', id),
+  retryFailed: (id: number): Promise<number> => ipcRenderer.invoke('analysis:retryFailed', id),
+  deleteJob: (id: number): Promise<void> => ipcRenderer.invoke('analysis:deleteJob', id),
+  getUnanalyzedCount: (secUid?: string): Promise<number> =>
+    ipcRenderer.invoke('analysis:getUnanalyzedCount', secUid),
+  getUnanalyzedCountByUser: (): Promise<{ sec_uid: string; nickname: string; count: number }[]> =>
+    ipcRenderer.invoke('analysis:getUnanalyzedCountByUser'),
+  getUserStats: (): Promise<UserAnalysisStats[]> => ipcRenderer.invoke('analysis:getUserStats'),
+  getTotalStats: (): Promise<TotalAnalysisStats> => ipcRenderer.invoke('analysis:getTotalStats'),
+  onQueue: (callback: (event: AnalysisQueueEvent) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, payload: AnalysisQueueEvent): void =>
+      callback(payload)
+    ipcRenderer.on('analysis:queue', handler)
+    return () => ipcRenderer.removeListener('analysis:queue', handler)
+  }
+}
+
+const tagAPI = {
+  getOverviewStats: (): Promise<TagOverviewStats> => ipcRenderer.invoke('tag:getOverviewStats'),
+  getUserStats: (): Promise<UserTagStats[]> => ipcRenderer.invoke('tag:getUserStats'),
+  getLibraryStats: (): Promise<TagLibraryStats> => ipcRenderer.invoke('tag:getLibraryStats'),
+  getTagsWithFrequency: (secUid?: string): Promise<TagFrequencyItem[]> =>
+    ipcRenderer.invoke('tag:getTagsWithFrequency', secUid),
+  getCategories: (): Promise<TagCategoryItem[]> => ipcRenderer.invoke('tag:getCategories'),
+  getFilterFacets: (filters?: TagPostFilters): Promise<TagFilterFacets> =>
+    ipcRenderer.invoke('tag:getFilterFacets', filters),
+  getPost: (postId: number): Promise<DbPost | undefined> =>
+    ipcRenderer.invoke('tag:getPost', postId),
+  queryPosts: (
+    filters?: TagPostFilters,
+    page?: number,
+    pageSize?: number
+  ): Promise<{ posts: DbPost[]; total: number }> =>
+    ipcRenderer.invoke('tag:queryPosts', filters, page, pageSize),
+  queryPostIds: (filters?: TagPostFilters): Promise<number[]> =>
+    ipcRenderer.invoke('tag:queryPostIds', filters),
+  addTags: (postIds: number[], tags: string[]): Promise<number> =>
+    ipcRenderer.invoke('tag:addTags', postIds, tags),
+  setPostTags: (
+    postId: number,
+    input: { aiTags?: string[]; manualTags?: string[] }
+  ): Promise<void> => ipcRenderer.invoke('tag:setPostTags', postId, input),
+  clear: (postIds: number[], scope: 'all' | 'ai' | 'manual'): Promise<number> =>
+    ipcRenderer.invoke('tag:clear', postIds, scope),
+  rename: (oldName: string, newName: string): Promise<number> =>
+    ipcRenderer.invoke('tag:rename', oldName, newName),
+  merge: (names: string[], into: string): Promise<number> =>
+    ipcRenderer.invoke('tag:merge', names, into),
+  deleteTag: (names: string[]): Promise<number> => ipcRenderer.invoke('tag:delete', names),
+  addCustomTag: (name: string): Promise<void> => ipcRenderer.invoke('tag:addCustomTag', name),
+  getAliases: (): Promise<TagAliasItem[]> => ipcRenderer.invoke('tag:getAliases'),
+  addAlias: (alias: string, tag: string): Promise<void> =>
+    ipcRenderer.invoke('tag:addAlias', alias, tag),
+  removeAlias: (alias: string): Promise<void> => ipcRenderer.invoke('tag:removeAlias', alias)
+}
+
+const videoAPI = {
+  getDetail: (url: string): Promise<VideoInfo> => ipcRenderer.invoke('video:getDetail', url),
+  downloadToFolder: (info: VideoInfo): Promise<void> =>
+    ipcRenderer.invoke('video:downloadToFolder', info)
+}
+
+const panelAPI = {
+  status: (): Promise<PanelRuntimeStatus> => ipcRenderer.invoke('panel:status'),
+  apply: (): Promise<PanelRuntimeStatus> => ipcRenderer.invoke('panel:apply'),
+  issueLocalKey: (): Promise<{ apiKey: string; url: string }> =>
+    ipcRenderer.invoke('panel:issueLocalKey')
+}
+
+const systemAPI = {
+  getResourceUsage: (): Promise<SystemResourceInfo> =>
+    ipcRenderer.invoke('system:getResourceUsage'),
+  getWebServerInfo: (): Promise<WebServerInfo> => ipcRenderer.invoke('system:getWebServerInfo'),
+  openDirectoryDialog: (): Promise<string | null> => ipcRenderer.invoke('dialog:openDirectory'),
+  openDataDirectory: (): Promise<void> => ipcRenderer.invoke('system:openDataDirectory'),
+  openInAppBrowser: (url: string, title?: string): Promise<void> =>
+    ipcRenderer.invoke('system:openInAppBrowser', url, title)
+}
+
+const migrationAPI = {
+  execute: (
+    oldPath: string,
+    newPath: string
+  ): Promise<{ success: number; failed: number; total: number }> =>
+    ipcRenderer.invoke('migration:execute', oldPath, newPath),
+  getCount: (oldPath: string): Promise<number> => ipcRenderer.invoke('migration:getCount', oldPath)
+}
+
+const clipboardAPI = {
+  onDouyinLink: (callback: (link: string) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, link: string): void => callback(link)
+    ipcRenderer.on('clipboard-douyin-link', handler)
+    return () => ipcRenderer.removeListener('clipboard-douyin-link', handler)
+  }
+}
+
+const updaterAPI = {
+  check: (): Promise<UpdateInfo | undefined> => ipcRenderer.invoke('updater:check'),
+  download: (): Promise<void> => ipcRenderer.invoke('updater:download'),
+  install: (): void => {
+    ipcRenderer.invoke('updater:install')
+  },
+  getCurrentVersion: (): Promise<string> => ipcRenderer.invoke('updater:getCurrentVersion'),
+  onStatus: (callback: (status: UpdateStatus) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, status: UpdateStatus): void =>
+      callback(status)
+    ipcRenderer.on('updater:status', handler)
+    return () => ipcRenderer.removeListener('updater:status', handler)
+  }
+}
+
+const filesAPI = {
+  getUserPosts: (
+    userId: number,
+    page?: number,
+    pageSize?: number,
+    sort?: PostSortConfig
+  ): Promise<{ posts: DbPost[]; total: number }> =>
+    ipcRenderer.invoke('files:getUserPosts', userId, page, pageSize, sort),
+  fixAllTitles: (): Promise<{
+    success: boolean
+    result?: { fixed: number; skipped: number; failed: number }
+    error?: string
+  }> => ipcRenderer.invoke('files:fixAllTitles'),
+  getFileSizes: (secUid: string): Promise<{ totalSize: number; folderCount: number }> =>
+    ipcRenderer.invoke('files:getFileSizes', secUid),
+  getPostSize: (secUid: string, folderName: string): Promise<number> =>
+    ipcRenderer.invoke('files:getPostSize', secUid, folderName),
+  deletePost: (postId: number): Promise<boolean> => ipcRenderer.invoke('files:deletePost', postId),
+  deleteUserFiles: (userId: number, secUid: string): Promise<number> =>
+    ipcRenderer.invoke('files:deleteUserFiles', userId, secUid)
+}
+
+const dashboardAPI = {
+  getOverview: (): Promise<DashboardOverview> => ipcRenderer.invoke('dashboard:getOverview'),
+  getDownloadTrend: (days?: number): Promise<TrendPoint[]> =>
+    ipcRenderer.invoke('dashboard:getDownloadTrend', days),
+  getUserDistribution: (limit?: number): Promise<UserDistItem[]> =>
+    ipcRenderer.invoke('dashboard:getUserDistribution', limit),
+  getTopTags: (limit?: number): Promise<TagStatItem[]> =>
+    ipcRenderer.invoke('dashboard:getTopTags', limit),
+  getContentLevelDistribution: (): Promise<LevelDistItem[]> =>
+    ipcRenderer.invoke('dashboard:getContentLevelDistribution')
+}
+
+const scriptsAPI = {
+  list: (): Promise<ScriptDescriptor[]> => ipcRenderer.invoke('scripts:list'),
+  run: (id: string): Promise<ScriptRunResult> => ipcRenderer.invoke('scripts:run', id),
+  stop: (id: string): Promise<boolean> => ipcRenderer.invoke('scripts:stop', id),
+  running: (): Promise<string[]> => ipcRenderer.invoke('scripts:running'),
+  getLogs: (id: string): Promise<ScriptLogEntry[]> => ipcRenderer.invoke('scripts:getLogs', id),
+  clearLogs: (id: string): Promise<void> => ipcRenderer.invoke('scripts:clearLogs', id),
+  getDir: (): Promise<string> => ipcRenderer.invoke('scripts:getDir'),
+  openDir: (): Promise<void> => ipcRenderer.invoke('scripts:openDir'),
+  read: (id: string): Promise<string> => ipcRenderer.invoke('scripts:read', id),
+  template: (name: string, hook?: ScriptHookName | null): Promise<string> =>
+    ipcRenderer.invoke('scripts:template', name, hook),
+  create: (fileName: string, source: string): Promise<ScriptDescriptor> =>
+    ipcRenderer.invoke('scripts:create', fileName, source),
+  save: (fileName: string, source: string): Promise<ScriptDescriptor> =>
+    ipcRenderer.invoke('scripts:save', fileName, source),
+  rename: (from: string, to: string): Promise<ScriptDescriptor> =>
+    ipcRenderer.invoke('scripts:rename', from, to),
+  delete: (fileName: string): Promise<void> => ipcRenderer.invoke('scripts:delete', fileName),
+  getSchedules: (): Promise<ScriptScheduleInfo[]> => ipcRenderer.invoke('scripts:getSchedules'),
+  setSchedule: (
+    scriptId: string,
+    cron: string,
+    enabled: boolean
+  ): Promise<ScriptScheduleInfo | null> =>
+    ipcRenderer.invoke('scripts:setSchedule', scriptId, cron, enabled),
+  setHookEnabled: (scriptId: string, enabled: boolean): Promise<boolean> =>
+    ipcRenderer.invoke('scripts:setHookEnabled', scriptId, enabled),
+  setLogLimit: (scriptId: string, limit: number): Promise<number> =>
+    ipcRenderer.invoke('scripts:setLogLimit', scriptId, limit),
+  onLog: (callback: (entry: ScriptLogEntry) => void): (() => void) => {
+    const listener = (_event: unknown, entry: ScriptLogEntry): void => callback(entry)
+    ipcRenderer.on('scripts:log', listener)
+    return () => ipcRenderer.removeListener('scripts:log', listener)
+  },
+  onRunningChange: (callback: (ids: string[]) => void): (() => void) => {
+    const listener = (_event: unknown, ids: string[]): void => callback(ids)
+    ipcRenderer.on('scripts:running', listener)
+    return () => ipcRenderer.removeListener('scripts:running', listener)
+  }
+}
+
+const storageAPI = {
+  getConfig: (): Promise<StorageConfigView> => ipcRenderer.invoke('storage:getConfig'),
+  saveConfig: (input: StorageConfigInput): Promise<StorageConfigView> =>
+    ipcRenderer.invoke('storage:saveConfig', input),
+  test: (): Promise<StorageTestResult> => ipcRenderer.invoke('storage:test'),
+  getStats: (): Promise<StorageQueueStats> => ipcRenderer.invoke('storage:getStats'),
+  enqueueAll: (): Promise<number> => ipcRenderer.invoke('storage:enqueueAll'),
+  retryFailed: (): Promise<number> => ipcRenderer.invoke('storage:retryFailed'),
+  getMigrationStatus: (): Promise<MigrationStatus> =>
+    ipcRenderer.invoke('storage:getMigrationStatus'),
+  startVerify: (): Promise<void> => ipcRenderer.invoke('storage:startVerify'),
+  previewPrune: (fraction: number): Promise<PrunePreview> =>
+    ipcRenderer.invoke('storage:previewPrune', fraction),
+  startPrune: (fraction: number): Promise<void> =>
+    ipcRenderer.invoke('storage:startPrune', fraction)
+}
+
+const api = {
+  db: dbAPI,
+  settings: settingsAPI,
+  cookie: cookieAPI,
+  douyin: douyinAPI,
+  user: userAPI,
+  task: taskAPI,
+  download: downloadAPI,
+  sync: syncAPI,
+  scheduler: schedulerAPI,
+  collect: collectAPI,
+  live: liveAPI,
+  post: postAPI,
+  ai: aiAPI,
+  asr: asrAPI,
+  analysis: analysisAPI,
+  tag: tagAPI,
+  video: videoAPI,
+  system: systemAPI,
+  updater: updaterAPI,
+  migration: migrationAPI,
+  clipboard: clipboardAPI,
+  files: filesAPI,
+  dashboard: dashboardAPI,
+  scripts: scriptsAPI,
+  storage: storageAPI,
+  panel: panelAPI
+}
+
+if (process.contextIsolated) {
+  try {
+    contextBridge.exposeInMainWorld('electron', electronAPI)
+    contextBridge.exposeInMainWorld('api', api)
+  } catch (error) {
+    console.error(error)
+  }
+} else {
+  // @ts-ignore (define in dts)
+  window.electron = electronAPI
+  // @ts-ignore (define in dts)
+  window.api = api
+}

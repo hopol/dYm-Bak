@@ -1,0 +1,741 @@
+import cron, { type ScheduledTask as CronScheduledTask } from 'node-cron'
+import { BrowserWindow } from 'electron'
+import {
+  getAutoSyncUsers,
+  getAutoSyncTasks,
+  getLiveRecordUsers,
+  getScriptSchedules,
+  getScriptSchedule,
+  getSetting,
+  getUserById,
+  getTaskById,
+  updateTaskLastSyncAt,
+  type DbUser,
+  type DbTaskWithUsers,
+  type DbScriptSchedule
+} from '../database'
+import { appEvents } from './app-events'
+import { startUserSync, isUserSyncing, stopUserSync } from './download/syncer'
+import { startDownloadTask, isTaskRunning, stopDownloadTask } from './download/downloader'
+import { addUserByUrl } from './users/add'
+import { isCollectSyncEnabled, getCollectCron, pullCollectedItems } from './download/collect-sync'
+import { checkAndRecordUser, isRecordingLive, stopLiveRecording } from './live/recorder'
+import { runScript, isScriptRunning } from './scripts/runner'
+import { getScriptName } from './scripts/loader'
+import { SyncQueue } from './sync-queue'
+
+export interface SchedulerLog {
+  timestamp: number
+  level: 'info' | 'warn' | 'error'
+  message: string
+  type: 'user' | 'task' | 'system'
+  targetName?: string
+}
+
+const MAX_LOG_BUFFER_SIZE = 500
+const logBuffer: SchedulerLog[] = []
+
+function sendSchedulerLog(log: Omit<SchedulerLog, 'timestamp'>): void {
+  const fullLog: SchedulerLog = { ...log, timestamp: Date.now() }
+
+  // 保存到缓冲区
+  logBuffer.unshift(fullLog)
+  if (logBuffer.length > MAX_LOG_BUFFER_SIZE) {
+    logBuffer.pop()
+  }
+
+  // 发送到前端
+  const windows = BrowserWindow.getAllWindows()
+  for (const win of windows) {
+    win.webContents.send('scheduler:log', fullLog)
+  }
+
+  // 输出到终端
+  const prefix = `[Scheduler]`
+  const msg = log.targetName ? `${log.message} (${log.targetName})` : log.message
+  if (log.level === 'error') {
+    console.error(prefix, msg)
+  } else if (log.level === 'warn') {
+    console.warn(prefix, msg)
+  } else {
+    console.log(prefix, msg)
+  }
+}
+
+export function getSchedulerLogs(): SchedulerLog[] {
+  return [...logBuffer]
+}
+
+export function clearSchedulerLogs(): void {
+  logBuffer.length = 0
+}
+
+interface ScheduledUserTask {
+  userId: number
+  task: CronScheduledTask
+}
+
+interface ScheduledDownloadTask {
+  taskId: number
+  task: CronScheduledTask
+}
+
+const scheduledUserTasks: Map<number, ScheduledUserTask> = new Map()
+const scheduledDownloadTasks: Map<number, ScheduledDownloadTask> = new Map()
+const scheduledLiveTasks: Map<number, ScheduledUserTask> = new Map()
+
+// 定时同步排队：到点的作者统一进队列，按并发数逐个跑，跑完间隔一段（±50% 抖动）再开下一个，
+// 避免同一整点的几十个作者同时请求抖音被风控
+const DEFAULT_SCHEDULE_CONCURRENCY = 1
+const MAX_SCHEDULE_CONCURRENCY = 5
+const DEFAULT_SCHEDULE_GAP_SECONDS = 15
+const MAX_SCHEDULE_GAP_SECONDS = 600
+
+function readIntSetting(key: string, fallback: number, min: number, max: number): number {
+  const raw = getSetting(key)
+  if (raw === null || raw.trim() === '') return fallback
+  const n = Math.trunc(Number(raw))
+  return Number.isFinite(n) ? Math.min(Math.max(n, min), max) : fallback
+}
+
+const userSyncQueue = new SyncQueue({
+  concurrency: () =>
+    readIntSetting(
+      'schedule_sync_concurrency',
+      DEFAULT_SCHEDULE_CONCURRENCY,
+      1,
+      MAX_SCHEDULE_CONCURRENCY
+    ),
+  gapMs: () =>
+    readIntSetting(
+      'schedule_sync_gap_seconds',
+      DEFAULT_SCHEDULE_GAP_SECONDS,
+      0,
+      MAX_SCHEDULE_GAP_SECONDS
+    ) * 1000,
+  run: async (userId) => {
+    // 排队期间作者可能被删除或关掉了自动同步，以执行时的最新状态为准
+    const user = getUserById(userId)
+    if (!user || !user.auto_sync) return
+    await executeUserSync(user)
+  }
+})
+
+function enqueueScheduledSync(user: DbUser): void {
+  if (isUserSyncing(user.id)) {
+    sendSchedulerLog({
+      level: 'warn',
+      message: '用户正在同步中，跳过',
+      type: 'user',
+      targetName: user.nickname
+    })
+    return
+  }
+  const ahead = userSyncQueue.pendingCount
+  if (!userSyncQueue.enqueue(user.id)) return // 已在队列里，本轮不重复排
+  if (ahead > 0) {
+    sendSchedulerLog({
+      level: 'info',
+      message: `到点，已加入同步队列（前面还有 ${ahead} 个）`,
+      type: 'user',
+      targetName: user.nickname
+    })
+  }
+}
+
+export function getUserSyncQueueSize(): number {
+  return userSyncQueue.pendingCount
+}
+
+function isValidCron(expression: string): boolean {
+  return cron.validate(expression)
+}
+
+async function executeUserSync(user: DbUser): Promise<void> {
+  if (isUserSyncing(user.id)) {
+    sendSchedulerLog({
+      level: 'warn',
+      message: '用户正在同步中，跳过',
+      type: 'user',
+      targetName: user.nickname
+    })
+    return
+  }
+
+  sendSchedulerLog({
+    level: 'info',
+    message: '开始定时同步',
+    type: 'user',
+    targetName: user.nickname
+  })
+  try {
+    // startUserSync 把运行期错误收敛进返回值，只有用户不存在 / 未配 Cookie 这类前置问题才会抛
+    const result = await startUserSync(user.id, { source: 'schedule' })
+    if (result.status === 'completed') {
+      sendSchedulerLog({
+        level: 'info',
+        message: `定时同步完成，新下载 ${result.downloaded} 个`,
+        type: 'user',
+        targetName: user.nickname
+      })
+    } else if (result.status === 'cancelled') {
+      sendSchedulerLog({
+        level: 'warn',
+        message: '定时同步被取消',
+        type: 'user',
+        targetName: user.nickname
+      })
+    } else {
+      sendSchedulerLog({
+        level: 'error',
+        message: `同步失败: ${result.error ?? '未知错误'}`,
+        type: 'user',
+        targetName: user.nickname
+      })
+    }
+  } catch (error) {
+    sendSchedulerLog({
+      level: 'error',
+      message: `同步失败: ${(error as Error).message}`,
+      type: 'user',
+      targetName: user.nickname
+    })
+  }
+}
+
+export function scheduleUser(user: DbUser): void {
+  if (scheduledUserTasks.has(user.id)) {
+    unscheduleUser(user.id)
+  }
+
+  if (!user.auto_sync || !user.sync_cron) {
+    return
+  }
+
+  if (!isValidCron(user.sync_cron)) {
+    sendSchedulerLog({
+      level: 'error',
+      message: `无效的 Cron 表达式: ${user.sync_cron}`,
+      type: 'user',
+      targetName: user.nickname
+    })
+    return
+  }
+
+  const task = cron.schedule(user.sync_cron, () => {
+    enqueueScheduledSync(user)
+  })
+
+  scheduledUserTasks.set(user.id, { userId: user.id, task })
+  sendSchedulerLog({
+    level: 'info',
+    message: `已注册定时同步 (${user.sync_cron})`,
+    type: 'user',
+    targetName: user.nickname
+  })
+}
+
+export function unscheduleUser(userId: number): void {
+  const scheduled = scheduledUserTasks.get(userId)
+  if (scheduled) {
+    scheduled.task.stop()
+    scheduledUserTasks.delete(userId)
+    sendSchedulerLog({ level: 'info', message: `已取消定时同步 (用户ID: ${userId})`, type: 'user' })
+  }
+}
+
+// 直播录制：按用户 cron 定时检测开播，在播即开始录制
+async function executeLiveCheck(user: DbUser): Promise<void> {
+  if (isRecordingLive(user.id)) {
+    // 已在录制中，无需重复检测
+    return
+  }
+  try {
+    const started = await checkAndRecordUser(user.id)
+    if (started) {
+      sendSchedulerLog({
+        level: 'info',
+        message: '检测到开播，开始录制',
+        type: 'user',
+        targetName: user.nickname
+      })
+    }
+  } catch (error) {
+    sendSchedulerLog({
+      level: 'error',
+      message: `直播检测失败: ${(error as Error).message}`,
+      type: 'user',
+      targetName: user.nickname
+    })
+  }
+}
+
+export function scheduleUserLive(user: DbUser): void {
+  if (scheduledLiveTasks.has(user.id)) {
+    unscheduleUserLive(user.id)
+  }
+
+  if ((user.platform && user.platform !== 'douyin') || !user.live_record || !user.live_check_cron) {
+    return
+  }
+
+  if (!isValidCron(user.live_check_cron)) {
+    sendSchedulerLog({
+      level: 'error',
+      message: `无效的直播检测 Cron 表达式: ${user.live_check_cron}`,
+      type: 'user',
+      targetName: user.nickname
+    })
+    return
+  }
+
+  const task = cron.schedule(user.live_check_cron, () => {
+    void executeLiveCheck(user)
+  })
+
+  scheduledLiveTasks.set(user.id, { userId: user.id, task })
+  sendSchedulerLog({
+    level: 'info',
+    message: `已注册直播检测 (${user.live_check_cron})`,
+    type: 'user',
+    targetName: user.nickname
+  })
+}
+
+export function unscheduleUserLive(userId: number): void {
+  const scheduled = scheduledLiveTasks.get(userId)
+  if (scheduled) {
+    scheduled.task.stop()
+    scheduledLiveTasks.delete(userId)
+    sendSchedulerLog({ level: 'info', message: `已取消直播检测 (用户ID: ${userId})`, type: 'user' })
+  }
+}
+
+// Task scheduling functions
+async function executeTaskDownload(task: DbTaskWithUsers): Promise<void> {
+  if (isTaskRunning(task.id)) {
+    sendSchedulerLog({
+      level: 'warn',
+      message: '任务正在运行中，跳过',
+      type: 'task',
+      targetName: task.name
+    })
+    return
+  }
+
+  sendSchedulerLog({ level: 'info', message: '开始定时下载', type: 'task', targetName: task.name })
+  try {
+    const result = await startDownloadTask(task.id, { source: 'schedule' })
+    if (result.status === 'completed') {
+      // 只有真正跑完才算一次成功同步，失败 / 取消不更新 last_sync_at
+      updateTaskLastSyncAt(task.id)
+      sendSchedulerLog({
+        level: 'info',
+        message: `定时下载完成，新下载 ${result.downloaded} 个`,
+        type: 'task',
+        targetName: task.name
+      })
+    } else if (result.status === 'cancelled') {
+      sendSchedulerLog({
+        level: 'warn',
+        message: '定时下载被取消',
+        type: 'task',
+        targetName: task.name
+      })
+    } else {
+      sendSchedulerLog({
+        level: 'error',
+        message: `执行失败: ${result.error ?? '未知错误'}`,
+        type: 'task',
+        targetName: task.name
+      })
+    }
+  } catch (error) {
+    sendSchedulerLog({
+      level: 'error',
+      message: `执行失败: ${(error as Error).message}`,
+      type: 'task',
+      targetName: task.name
+    })
+  }
+}
+
+export function scheduleTask(task: DbTaskWithUsers): void {
+  if (scheduledDownloadTasks.has(task.id)) {
+    unscheduleTask(task.id)
+  }
+
+  if (!task.auto_sync || !task.sync_cron) {
+    return
+  }
+
+  if (!isValidCron(task.sync_cron)) {
+    sendSchedulerLog({
+      level: 'error',
+      message: `无效的 Cron 表达式: ${task.sync_cron}`,
+      type: 'task',
+      targetName: task.name
+    })
+    return
+  }
+
+  const cronTask = cron.schedule(task.sync_cron, () => {
+    executeTaskDownload(task)
+  })
+
+  scheduledDownloadTasks.set(task.id, { taskId: task.id, task: cronTask })
+  sendSchedulerLog({
+    level: 'info',
+    message: `已注册定时下载 (${task.sync_cron})`,
+    type: 'task',
+    targetName: task.name
+  })
+}
+
+export function unscheduleTask(taskId: number): void {
+  const scheduled = scheduledDownloadTasks.get(taskId)
+  if (scheduled) {
+    scheduled.task.stop()
+    scheduledDownloadTasks.delete(taskId)
+    sendSchedulerLog({ level: 'info', message: `已取消定时下载 (任务ID: ${taskId})`, type: 'task' })
+  }
+}
+
+/**
+ * 按数据库里的最新配置重建某用户的两类定时任务（作品同步 + 直播检测）。
+ * 用户设置被改动（IPC、Web 端、脚本 API）后都应调用，让调度器与库保持一致，
+ * 而不是依赖渲染端记得再发一次「更新调度」IPC。
+ */
+export function syncUserSchedules(userId: number): void {
+  const user = getUserById(userId)
+  if (!user) {
+    clearUserSchedules(userId)
+    return
+  }
+  scheduleUser(user)
+  scheduleUserLive(user)
+}
+
+/** 用户被删除时调用：撤掉它的全部定时任务，否则 cron 会一直对着不存在的用户报错 */
+export function clearUserSchedules(userId: number): void {
+  unscheduleUser(userId)
+  unscheduleUserLive(userId)
+}
+
+/** 按数据库里的最新配置重建某下载任务的定时执行 */
+export function syncTaskSchedule(taskId: number): void {
+  const task = getTaskById(taskId)
+  if (!task) {
+    unscheduleTask(taskId)
+    return
+  }
+  scheduleTask(task)
+}
+
+// 收藏同步：定时从暂存服务拉取 aweme_id，逐个走「添加用户」
+let collectSyncTask: CronScheduledTask | null = null
+let collectSyncRunning = false
+
+export async function executeCollectSync(): Promise<void> {
+  if (collectSyncRunning) {
+    sendSchedulerLog({ level: 'warn', message: '收藏同步正在进行中，跳过', type: 'system' })
+    return
+  }
+  collectSyncRunning = true
+  try {
+    sendSchedulerLog({ level: 'info', message: '开始收藏同步，拉取暂存列表', type: 'system' })
+    const items = await pullCollectedItems()
+    if (items.length === 0) {
+      sendSchedulerLog({ level: 'info', message: '收藏同步：暂存列表为空', type: 'system' })
+      return
+    }
+    sendSchedulerLog({
+      level: 'info',
+      message: `收藏同步：拉取到 ${items.length} 条，开始添加`,
+      type: 'system'
+    })
+
+    let processed = 0
+    let failed = 0
+    for (const item of items) {
+      const awemeId = String(item.aweme_id || '').trim()
+      if (!awemeId) continue
+      const url = `https://www.douyin.com/video/${awemeId}`
+      try {
+        const result = await addUserByUrl(url)
+        processed++
+        sendSchedulerLog({
+          level: 'info',
+          message: result.isNewUser ? '新增作者' : '作者已存在',
+          type: 'user',
+          targetName: result.user.nickname
+        })
+      } catch (error) {
+        failed++
+        sendSchedulerLog({
+          level: 'error',
+          message: `添加失败 (aweme ${awemeId}): ${(error as Error).message}`,
+          type: 'system'
+        })
+      }
+    }
+    sendSchedulerLog({
+      level: 'info',
+      message: `收藏同步完成：成功 ${processed}，失败 ${failed}`,
+      type: 'system'
+    })
+  } catch (error) {
+    sendSchedulerLog({
+      level: 'error',
+      message: `收藏同步失败: ${(error as Error).message}`,
+      type: 'system'
+    })
+  } finally {
+    collectSyncRunning = false
+  }
+}
+
+export function scheduleCollectSync(): void {
+  unscheduleCollectSync()
+  if (!isCollectSyncEnabled()) {
+    return
+  }
+  const cronExpr = getCollectCron()
+  if (!isValidCron(cronExpr)) {
+    sendSchedulerLog({
+      level: 'error',
+      message: `收藏同步无效的 Cron 表达式: ${cronExpr}`,
+      type: 'system'
+    })
+    return
+  }
+  collectSyncTask = cron.schedule(cronExpr, () => {
+    void executeCollectSync()
+  })
+  sendSchedulerLog({ level: 'info', message: `已注册收藏同步 (${cronExpr})`, type: 'system' })
+}
+
+export function unscheduleCollectSync(): void {
+  if (collectSyncTask) {
+    collectSyncTask.stop()
+    collectSyncTask = null
+  }
+}
+
+// 脚本定时执行：计划存在 script_schedules 表，脚本文件本身不进库
+const scheduledScriptTasks: Map<string, CronScheduledTask> = new Map()
+
+/** 取脚本的展示名，脚本已被删除或加载失败时退回 id */
+function scriptDisplayName(scriptId: string): string {
+  try {
+    return getScriptName(scriptId)
+  } catch {
+    return scriptId
+  }
+}
+
+async function executeScriptRun(scriptId: string): Promise<void> {
+  const name = scriptDisplayName(scriptId)
+
+  // 手动运行与定时运行共用 runner 的运行集合，这里先挡一道以便记录「跳过」
+  if (isScriptRunning(scriptId)) {
+    sendSchedulerLog({
+      level: 'warn',
+      message: '脚本正在运行中，跳过本次定时执行',
+      type: 'system',
+      targetName: name
+    })
+    return
+  }
+
+  sendSchedulerLog({ level: 'info', message: '开始定时执行脚本', type: 'system', targetName: name })
+  try {
+    // runScript 自己把失败收敛进返回值，只有加载不出脚本这类问题才会抛
+    // 定时执行不能重放上次钩子入参，否则 cron 每次都会把同一个作品再处理一遍
+    const result = await runScript(scriptId, { replayLastHook: false })
+    if (result.ok) {
+      sendSchedulerLog({
+        level: 'info',
+        message: '脚本执行完成',
+        type: 'system',
+        targetName: name
+      })
+    } else {
+      sendSchedulerLog({
+        level: result.cancelled ? 'warn' : 'error',
+        message: `脚本执行未成功: ${result.error ?? '未知原因'}`,
+        type: 'system',
+        targetName: name
+      })
+    }
+  } catch (error) {
+    sendSchedulerLog({
+      level: 'error',
+      message: `脚本执行失败: ${(error as Error).message}`,
+      type: 'system',
+      targetName: name
+    })
+  }
+}
+
+export function scheduleScript(schedule: DbScriptSchedule): void {
+  unscheduleScript(schedule.script_id)
+
+  if (!schedule.enabled || !schedule.cron) {
+    return
+  }
+
+  const name = scriptDisplayName(schedule.script_id)
+
+  if (!isValidCron(schedule.cron)) {
+    sendSchedulerLog({
+      level: 'error',
+      message: `脚本定时无效的 Cron 表达式: ${schedule.cron}`,
+      type: 'system',
+      targetName: name
+    })
+    return
+  }
+
+  const task = cron.schedule(schedule.cron, () => {
+    void executeScriptRun(schedule.script_id)
+  })
+
+  scheduledScriptTasks.set(schedule.script_id, task)
+  sendSchedulerLog({
+    level: 'info',
+    message: `已注册脚本定时执行 (${schedule.cron})`,
+    type: 'system',
+    targetName: name
+  })
+}
+
+export function unscheduleScript(scriptId: string): void {
+  const task = scheduledScriptTasks.get(scriptId)
+  if (task) {
+    task.stop()
+    scheduledScriptTasks.delete(scriptId)
+  }
+}
+
+/** 按数据库里的最新计划重建某个脚本的定时任务 */
+export function rescheduleScript(scriptId: string): void {
+  const schedule = getScriptSchedule(scriptId)
+  if (schedule) {
+    scheduleScript(schedule)
+  } else {
+    unscheduleScript(scriptId)
+  }
+}
+
+/**
+ * 下次执行时间，未注册定时任务时为 null。
+ * 直接问 node-cron，避免自己再实现一遍 cron 推算。
+ */
+export function getScriptNextRun(scriptId: string): number | null {
+  const next = scheduledScriptTasks.get(scriptId)?.getNextRun()
+  return next ? next.getTime() : null
+}
+
+let dataChangeListenersBound = false
+
+/**
+ * 订阅数据库层的配置变更事件：无论改动来自桌面端 IPC、Web 端还是脚本 API，
+ * cron 都跟着库里的最新配置走；用户 / 任务被删时顺带停掉正在跑的工作。
+ */
+function bindDataChangeListeners(): void {
+  if (dataChangeListenersBound) return
+  dataChangeListenersBound = true
+  appEvents.onDataChange('user:settings-changed', (userId) => syncUserSchedules(userId))
+  appEvents.onDataChange('user:deleted', (userId) => {
+    clearUserSchedules(userId)
+    stopUserSync(userId)
+    stopLiveRecording(userId)
+  })
+  appEvents.onDataChange('task:changed', (taskId) => syncTaskSchedule(taskId))
+  appEvents.onDataChange('task:deleted', (taskId) => {
+    unscheduleTask(taskId)
+    stopDownloadTask(taskId)
+  })
+}
+
+export function initScheduler(): void {
+  bindDataChangeListeners()
+
+  // Initialize user-level scheduling
+  const users = getAutoSyncUsers()
+  sendSchedulerLog({
+    level: 'info',
+    message: `初始化完成，${users.length} 个用户自动同步`,
+    type: 'system'
+  })
+  for (const user of users) {
+    scheduleUser(user)
+  }
+
+  // Initialize task-level scheduling
+  const tasks = getAutoSyncTasks()
+  sendSchedulerLog({
+    level: 'info',
+    message: `初始化完成，${tasks.length} 个任务自动同步`,
+    type: 'system'
+  })
+  for (const task of tasks) {
+    scheduleTask(task)
+  }
+
+  // Initialize collect (favorites) sync
+  scheduleCollectSync()
+
+  // Initialize script scheduling
+  const scriptSchedules = getScriptSchedules().filter((item) => item.enabled && item.cron)
+  sendSchedulerLog({
+    level: 'info',
+    message: `初始化完成，${scriptSchedules.length} 个脚本定时执行`,
+    type: 'system'
+  })
+  for (const schedule of scriptSchedules) {
+    scheduleScript(schedule)
+  }
+
+  // Initialize live recording scheduling
+  const liveUsers = getLiveRecordUsers()
+  sendSchedulerLog({
+    level: 'info',
+    message: `初始化完成，${liveUsers.length} 个用户直播录制`,
+    type: 'system'
+  })
+  for (const user of liveUsers) {
+    scheduleUserLive(user)
+  }
+}
+
+export function stopScheduler(): void {
+  for (const [userId] of scheduledUserTasks) {
+    unscheduleUser(userId)
+  }
+  for (const [taskId] of scheduledDownloadTasks) {
+    unscheduleTask(taskId)
+  }
+  for (const [userId] of scheduledLiveTasks) {
+    unscheduleUserLive(userId)
+  }
+  for (const scriptId of [...scheduledScriptTasks.keys()]) {
+    unscheduleScript(scriptId)
+  }
+  unscheduleCollectSync()
+  userSyncQueue.clear()
+  sendSchedulerLog({ level: 'info', message: '所有定时任务已停止', type: 'system' })
+}
+
+export function getScheduledUserIds(): number[] {
+  return Array.from(scheduledUserTasks.keys())
+}
+
+export function getScheduledTaskIds(): number[] {
+  return Array.from(scheduledDownloadTasks.keys())
+}
+
+export function validateCronExpression(expression: string): boolean {
+  return isValidCron(expression)
+}

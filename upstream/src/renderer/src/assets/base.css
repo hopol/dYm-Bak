@@ -1,0 +1,125 @@
+:root {
+  --bg: #f5f5f7;
+  --surface: #ffffff;
+  --surface-muted: #f2f2f4;
+  --border: #e5e5e7;
+  --text-primary: #1d1d1f;
+  --text-secondary: #6e6e73;
+  --text-tertiary: #a1a1a6;
+  --accent: #0a84ff;
+  --accent-soft: #e8f0fe;
+  --success: #1f9d55;
+  --success-soft: #e6f6ec;
+  --warning: #c27803;
+  --warning-soft: #fff4de;
+  --danger: #e5484d;
+  --danger-soft: #fdecec;
+  --live: #ff2d55;
+
+  --accent-primary: var(--accent);
+  --accent-secondary: #5ac8fa;
+  --bg-primary: var(--bg);
+  --bg-surface: var(--surface);
+  --bg-active: var(--accent-soft);
+  --bg-hover: var(--surface-muted);
+  --border-color: var(--border);
+  --text-muted: var(--text-tertiary);
+
+  /* shadcn/ui 变量映射 */
+  --background: 240 10% 97%;
+  --foreground: 240 4% 12%;
+  --card: 0 0% 100%;
+  --card-foreground: 240 4% 12%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 240 4% 12%;
+  --primary: 209 100% 52%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 240 6% 95%;
+  --secondary-foreground: 240 4% 16%;
+  --muted: 240 6% 95%;
+  --muted-foreground: 240 4% 44%;
+  --destructive: 4 100% 59%;
+  --destructive-foreground: 0 0% 98%;
+  --input: 240 6% 90%;
+  --ring: 209 100% 52%;
+  --radius: 0.75rem;
+}
+
+body {
+  min-height: 100vh;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  line-height: 1.5;
+  font-family:
+    'Noto Sans SC',
+    -apple-system,
+    BlinkMacSystemFont,
+    'SF Pro Text',
+    'SF Pro Display',
+    'Segoe UI',
+    Roboto,
+    Oxygen,
+    Ubuntu,
+    Cantarell,
+    'Fira Sans',
+    'Droid Sans',
+    'Helvetica Neue',
+    sans-serif;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.font-mono {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+:where(button, a, input, textarea, select, summary, [role='button']) {
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease,
+    box-shadow 150ms ease,
+    transform 150ms ease,
+    opacity 150ms ease;
+}
+
+:where(a, summary):focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+:where(button, [role='button']):focus-visible {
+  outline: none;
+}
+
+:where(div, svg, span, section, li):focus,
+:where(div, svg, span, section, li):focus-visible {
+  outline: none;
+}
+
+/* Recharts 图表焦点边框 — 高特异性 + !important 覆盖 Chromium 原生焦点指示器 */
+[class*='recharts']:focus,
+[class*='recharts']:focus-visible,
+[class*='recharts'] *:focus,
+[class*='recharts'] *:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+  border-color: transparent !important;
+}
+
+:where(input, textarea, select):focus-visible {
+  outline: none;
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.25);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :where(button, a, input, textarea, select, summary, [role='button']) {
+    transition: none !important;
+  }
+}
+
+#root {
+  min-height: 100vh;
+}

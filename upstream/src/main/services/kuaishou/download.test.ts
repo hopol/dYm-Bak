@@ -1,0 +1,242 @@
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from 'fs'
+import { join } from 'path'
+import { tmpdir } from 'os'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const ROOT = join(tmpdir(), 'dym-kuaishou-download-test')
+const settings: Record<string, string> = {}
+const existing = new Set<string>()
+const createPost = vi.fn()
+
+vi.mock('../../database', () => ({
+  getSetting: (key: string) => settings[key] ?? '',
+  getPostByAwemeId: (id: string) => (existing.has(id) ? { aweme_id: id } : undefined),
+  createPost: (...args: unknown[]) => createPost(...args)
+}))
+vi.mock('../media', () => ({ getDownloadPath: () => ROOT }))
+vi.mock('../scripts/emit', () => ({ emitPostDownloaded: vi.fn() }))
+vi.mock('./guard', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./guard')>()),
+  withKuaishouDownloadThrottle: <T>(task: () => Promise<T>) => task()
+}))
+
+// 投稿按 12 个一页，从新到旧编号 w0 起
+const TOTAL = 30
+const fetchKuaishouFeedPage = vi.fn()
+const fetchKuaishouWork = vi.fn()
+vi.mock('./client', () => ({
+  fetchKuaishouFeedPage: (...args: unknown[]) => fetchKuaishouFeedPage(...args),
+  fetchKuaishouWork: (...args: unknown[]) => fetchKuaishouWork(...args)
+}))
+
+// 下载器只在临时目录里造文件，按 polydl 的文件名返回结果
+const downloadWork = vi.fn()
+vi.mock('polydl', () => ({
+  KuaishouDownloader: class {
+    downloadWork = (...args: unknown[]): unknown => downloadWork(...args)
+  }
+}))
+
+const { KuaishouCooldownError, markKuaishouQuota, resetKuaishouGuardForTests } =
+  await import('./guard')
+const { downloadKuaishouCreator, downloadKuaishouWork } = await import('./download')
+
+const work = (index: number, overrides: object = {}): Record<string, unknown> => ({
+  workId: `w${index}`,
+  workType: 'video',
+  videoUrl: 'https://cdn.example/v.mp4',
+  caption: '',
+  desc: '',
+  createTime: '',
+  ...overrides
+})
+const page = (cursor: string): unknown => {
+  const start = cursor ? Number(cursor) : 0
+  const works = Array.from({ length: 12 }, (_, i) => start + i)
+    .filter((i) => i < TOTAL)
+    .map((i) => work(i))
+  const next = start + 12 < TOTAL ? String(start + 12) : 'no_more'
+  return { works, pcursor: next, finished: next === 'no_more' }
+}
+const creator = { id: 1, uid: 'u1', nickname: 'up', sec_uid: 'ks_u1' } as never
+
+function fakeDownload(item: { workId: string; workType: string }, dir: string): unknown[] {
+  const folder = join(dir, item.workId)
+  mkdirSync(folder, { recursive: true })
+  const file = (name: string): string => {
+    writeFileSync(join(folder, name), 'x')
+    return join(folder, name)
+  }
+  const cover = { kind: 'cover', success: true, filePath: file('cover.jpg') }
+  if (item.workType === 'image') {
+    return [
+      cover,
+      { kind: 'image', index: 0, success: true, filePath: file('image_0.jpg') },
+      { kind: 'image', index: 1, success: true, filePath: file('image_1.webp') }
+    ]
+  }
+  return [cover, { kind: 'video', success: true, filePath: file('video.mp4') }]
+}
+
+async function plan(limit: number): Promise<{ pending: number; pages: number }> {
+  let pending = -1
+  await downloadKuaishouCreator(creator, {
+    limit,
+    concurrency: 1,
+    isAborted: () => false,
+    onProgress: (event) => {
+      if (event.message.startsWith('准备下载') || event.message.includes('没有新的投稿')) {
+        pending = event.total
+      }
+    }
+  })
+  return { pending, pages: fetchKuaishouFeedPage.mock.calls.length }
+}
+
+describe('downloadKuaishouCreator', () => {
+  beforeEach(() => {
+    for (const key of Object.keys(settings)) delete settings[key]
+    resetKuaishouGuardForTests()
+    existing.clear()
+    createPost.mockClear()
+    fetchKuaishouFeedPage.mockReset().mockImplementation(async (_uid, cursor) => page(cursor))
+    downloadWork.mockReset().mockImplementation(async (item, dir) => fakeDownload(item, dir))
+    rmSync(ROOT, { recursive: true, force: true })
+  })
+
+  it('默认只看最新 N 个：最新 5 个都已下载时不再往旧的翻', async () => {
+    for (let i = 0; i < 5; i++) existing.add(`ks_w${i}`)
+    expect(await plan(5)).toEqual({ pending: 0, pages: 1 })
+  })
+
+  it('补齐模式：跳过已下载的，凑够 N 个未下载的', async () => {
+    settings.download_limit_mode = 'backfill'
+    for (let i = 0; i < 14; i++) existing.add(`ks_w${i}`)
+    expect(await plan(5)).toEqual({ pending: 5, pages: 2 })
+  })
+
+  it('不限数量时翻完全部', async () => {
+    expect(await plan(0)).toEqual({ pending: TOTAL, pages: 3 })
+  })
+
+  it('翻页中途限流：等冷却结束，从同一页接着翻完', async () => {
+    fetchKuaishouFeedPage
+      .mockReset()
+      .mockImplementation(async (_uid, cursor) => page(cursor))
+      .mockResolvedValueOnce(page(''))
+      .mockRejectedValueOnce(new KuaishouCooldownError('快手限流', 'quota'))
+    const result = await downloadKuaishouCreator(creator, {
+      limit: 0,
+      concurrency: 1,
+      isAborted: () => false
+    })
+    expect(result).toMatchObject({ downloaded: TOTAL, notice: undefined })
+    expect(fetchKuaishouFeedPage.mock.calls.map((call) => call[1])).toEqual(['', '12', '12', '24'])
+  })
+
+  it('连续限流超过 3 次：不再等，已列出的照常下完并说明原因', async () => {
+    fetchKuaishouFeedPage
+      .mockReset()
+      .mockResolvedValueOnce(page(''))
+      .mockRejectedValue(new KuaishouCooldownError('快手限流', 'quota'))
+    const result = await downloadKuaishouCreator(creator, {
+      limit: 0,
+      concurrency: 1,
+      isAborted: () => false
+    })
+    expect(result).toMatchObject({ downloaded: 12, notice: '快手限流' })
+    expect(fetchKuaishouFeedPage).toHaveBeenCalledTimes(5)
+  })
+
+  it('等待限流恢复时取消同步：立刻结束，不下载', async () => {
+    let aborted = false
+    fetchKuaishouFeedPage.mockReset().mockImplementation(async () => markKuaishouQuota())
+    const result = await downloadKuaishouCreator(creator, {
+      limit: 0,
+      concurrency: 1,
+      isAborted: () => aborted,
+      onProgress: (event) => {
+        if (event.message.includes('限流')) aborted = true
+      }
+    })
+    expect(result.aborted).toBe(true)
+    expect(downloadWork).not.toHaveBeenCalled()
+  })
+
+  it('翻页中途要滑块验证：不等，已列出的作品照常下完', async () => {
+    fetchKuaishouFeedPage
+      .mockReset()
+      .mockResolvedValueOnce(page(''))
+      .mockRejectedValueOnce(new KuaishouCooldownError('快手要求滑块验证', 'captcha'))
+    const result = await downloadKuaishouCreator(creator, {
+      limit: 0,
+      concurrency: 1,
+      isAborted: () => false
+    })
+    expect(result).toMatchObject({ downloaded: 12, notice: '快手要求滑块验证' })
+  })
+
+  it('第一页就失败（未登录）：直接抛错', async () => {
+    fetchKuaishouFeedPage.mockReset().mockRejectedValue(new Error('快手未登录'))
+    await expect(
+      downloadKuaishouCreator(creator, { limit: 0, concurrency: 1, isAborted: () => false })
+    ).rejects.toThrow('快手未登录')
+  })
+})
+
+describe('downloadKuaishouWork', () => {
+  beforeEach(() => {
+    fetchKuaishouWork.mockReset()
+    existing.clear()
+    createPost.mockClear()
+    downloadWork.mockReset().mockImplementation(async (item, dir) => fakeDownload(item, dir))
+    rmSync(ROOT, { recursive: true, force: true })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+  })
+
+  it('视频改名成 <id>_video / <id>_cover，并按视频入库', async () => {
+    expect(await downloadKuaishouWork(creator, work(1) as never, 'single')).toBe(true)
+    expect(readdirSync(join(ROOT, 'ks_u1', 'w1')).sort()).toEqual(['w1_cover.jpg', 'w1_video.mp4'])
+    expect(createPost).toHaveBeenCalledWith(
+      expect.objectContaining({ aweme_id: 'ks_w1', aweme_type: 0, folder_name: 'w1' })
+    )
+  })
+
+  it('图集改名成 <id>_image_<从 1 起>，并按图文入库', async () => {
+    expect(
+      await downloadKuaishouWork(creator, work(2, { workType: 'image' }) as never, 'single')
+    ).toBe(true)
+    expect(readdirSync(join(ROOT, 'ks_u1', 'w2')).sort()).toEqual([
+      'w2_cover.jpg',
+      'w2_image_1.jpg',
+      'w2_image_2.webp'
+    ])
+    expect(createPost).toHaveBeenCalledWith(expect.objectContaining({ aweme_type: 68 }))
+  })
+
+  it('列表只给 HLS 地址：改用作品详情里的 mp4', async () => {
+    fetchKuaishouWork.mockResolvedValueOnce(work(4, { videoUrl: 'https://cdn.example/d.mp4' }))
+    const hls = work(4, { videoUrl: 'https://cdn.example/x_hlsob.m3u8?k=1' })
+    expect(await downloadKuaishouWork(creator, hls as never, 'single')).toBe(true)
+    expect(fetchKuaishouWork).toHaveBeenCalledWith('w4')
+    expect(downloadWork.mock.calls[0][0]).toMatchObject({ videoUrl: 'https://cdn.example/d.mp4' })
+  })
+
+  it('详情里也只有 HLS：按失败处理，不把播放列表存成视频', async () => {
+    fetchKuaishouWork.mockResolvedValueOnce(work(5, { videoUrl: 'https://cdn.example/y.m3u8' }))
+    const hls = work(5, { videoUrl: 'https://cdn.example/y.m3u8' })
+    expect(await downloadKuaishouWork(creator, hls as never, 'single')).toBe(false)
+    expect(downloadWork).not.toHaveBeenCalled()
+    expect(createPost).not.toHaveBeenCalled()
+  })
+
+  it('媒体文件下载失败：删掉目录，不入库', async () => {
+    downloadWork.mockImplementation(async (item: { workId: string }, dir: string) => {
+      mkdirSync(join(dir, item.workId), { recursive: true })
+      return [{ kind: 'video', success: false, error: 'HTTP 403' }]
+    })
+    expect(await downloadKuaishouWork(creator, work(3) as never, 'single')).toBe(false)
+    expect(readdirSync(join(ROOT, 'ks_u1'))).toEqual([])
+    expect(createPost).not.toHaveBeenCalled()
+  })
+})

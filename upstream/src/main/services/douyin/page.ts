@@ -1,0 +1,310 @@
+import { BrowserWindow, session, type Session } from 'electron'
+import { release } from 'os'
+import { getSetting } from '../../database'
+import { blockCustomProtocols } from '../../utils/block-protocols'
+import { getBrowserUserAgent } from '../../utils/user-agent'
+import { applyClientHints, installClientHintHeaders } from './client-hints'
+import { getDeviceProfile } from './device'
+
+/**
+ * 在真实抖音页面里发接口请求。
+ *
+ * 为什么要绕这一圈：收藏、收藏夹、点赞这三个接口被抖音的 ArgusSecurityPlugin 保护，
+ * 必须带 `x-secsdk-web-signature`——它由页面里的 secsdk 对整条 query 签名生成，
+ * 改一个参数就失效，逆向成本高且抖音随时会改。放在页面里发，签名是页面自己补的。
+ *
+ * 其余接口（作者作品、资料、详情等）不受影响，仍然走 polydl 直连，不必经过这里。
+ */
+
+/** 登录窗口用的分区，与 cookie.ts 共用，这样用户登录过就直接是登录态 */
+const PARTITION = 'persist:douyin-login'
+
+/** 页面停靠地址：个人页收藏 tab，加载后页面自己会发一次带完整参数的接口请求 */
+const HOME_URL = 'https://www.douyin.com/user/self?showTab=favorite_collection'
+
+/** 等页面发出可取样请求的上限 */
+const SAMPLE_TIMEOUT_MS = 40_000
+const SAMPLE_POLL_MS = 1500
+
+/** 空闲这么久就把窗口关掉，别一直占着内存 */
+const IDLE_CLOSE_MS = 5 * 60_000
+
+/**
+ * 这些参数一律不自己填，交给页面补。
+ * 自己填会和 secsdk/抖音自己的拦截器重复，签名对不上，返回 Sign Invalid。
+ */
+const PAGE_OWNED_PARAMS = new Set([
+  'webid',
+  'uifid',
+  'msToken',
+  'a_bogus',
+  'verifyFp',
+  'fp',
+  'timestamp',
+  'x-secsdk-web-signature'
+])
+
+interface PageResponse {
+  ok: boolean
+  status: number
+  /** 解析成功的 JSON；非 JSON 时为 null */
+  data: Record<string, unknown> | null
+  /** 非 JSON 时的原文，用于报错 */
+  text: string | null
+  /** 响应头，只在排查失败时打出来 */
+  headers: Record<string, string>
+}
+
+let win: BrowserWindow | null = null
+/** 从页面已发请求里抠出的业务参数（device_platform / browser_* / os_* 等） */
+let bizParams: string | null = null
+/**
+ * 页面请求里的 uifid。它属于 PAGE_OWNED_PARAMS，页面内请求不需要我们填；
+ * 记下来是给直连请求用的（见 user-post.ts）。设备级的值，关窗不清。
+ */
+let pageUifid: string | null = null
+/** 串行化，避免并发 executeJavaScript 互相干扰 */
+let queue: Promise<unknown> = Promise.resolve()
+let idleTimer: NodeJS.Timeout | null = null
+
+function scheduleIdleClose(): void {
+  if (idleTimer) clearTimeout(idleTimer)
+  idleTimer = setTimeout(() => closePage(), IDLE_CLOSE_MS)
+}
+
+/** 关掉页面窗口。下次调用会重新开，业务参数也重新取。 */
+export function closePage(): void {
+  if (idleTimer) {
+    clearTimeout(idleTimer)
+    idleTimer = null
+  }
+  if (win && !win.isDestroyed()) win.destroy()
+  win = null
+  bizParams = null
+}
+
+/**
+ * 把设置里那串 cookie 灌进分区。
+ * 用户从没在登录窗口登录过时，分区本身是空的，全靠这一步。
+ */
+async function injectCookies(ses: Session): Promise<number> {
+  const raw = getSetting('douyin_cookie')
+  if (!raw) throw new Error('未配置抖音 Cookie，请先在「设置 - 账号」里登录')
+
+  // 分区里已有同名 host-only Cookie（页面 JS 维护的 s_v_web_id、web_sign_token 等）时不再注入：
+  // 注入到 .douyin.com 会和它并存成两份，浏览器两份都发，值还可能不一致
+  const hostOnly = new Set(
+    (await ses.cookies.get({ url: 'https://www.douyin.com' }))
+      .filter((cookie) => cookie.hostOnly)
+      .map((cookie) => cookie.name)
+  )
+
+  let count = 0
+  for (const part of raw.split(';')) {
+    const eq = part.indexOf('=')
+    if (eq < 0) continue
+    const name = part.slice(0, eq).trim()
+    if (!name || hostOnly.has(name)) continue
+    try {
+      await ses.cookies.set({
+        url: 'https://www.douyin.com',
+        name,
+        value: part.slice(eq + 1).trim(),
+        domain: '.douyin.com',
+        path: '/',
+        secure: true
+      })
+      count++
+    } catch {
+      // 个别 cookie 名不合法就跳过，不影响整体登录态
+    }
+  }
+  return count
+}
+
+/**
+ * 取出业务参数。
+ * 做法是等页面自己发一次接口请求，从它的 URL 里抄参数——这样不管抖音以后加了什么
+ * 新的业务参数，我们都会跟着带上，不用手工维护一张表。
+ */
+async function readBizParams(
+  target: BrowserWindow
+): Promise<{ params: string; uifid: string | null }> {
+  const script = `
+    (() => {
+      const url = performance.getEntriesByType('resource')
+        .map((entry) => entry.name)
+        .find((name) => /\\/aweme\\/v1\\/web\\/.*(a_bogus|msToken)/.test(name))
+      if (!url) return null
+      const skip = ${JSON.stringify([...PAGE_OWNED_PARAMS])}
+      const query = new URLSearchParams(url.split('?')[1] || '')
+      const kept = []
+      for (const [key, value] of query.entries()) {
+        if (skip.includes(key)) continue
+        // 分页与目标参数由调用方传，这里不能抄过来，否则同名参数出现两次
+        if (['cursor', 'max_cursor', 'count', 'sec_user_id'].includes(key)) continue
+        kept.push(key + '=' + encodeURIComponent(value))
+      }
+      return JSON.stringify({ params: kept.join('&'), uifid: query.get('uifid') })
+    })()
+  `
+  const deadline = Date.now() + SAMPLE_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    if (target.isDestroyed()) throw new Error('抖音页面窗口已关闭')
+    const found = (await target.webContents.executeJavaScript(script).catch(() => null)) as
+      | string
+      | null
+    if (found) return JSON.parse(found) as { params: string; uifid: string | null }
+    await new Promise((resolve) => setTimeout(resolve, SAMPLE_POLL_MS))
+  }
+  throw new Error('抖音页面未发出可取样的请求，可能是 Cookie 已失效，请重新登录')
+}
+
+/** 确保窗口就绪且业务参数已取到 */
+async function ensurePage(): Promise<BrowserWindow> {
+  if (win && !win.isDestroyed() && bizParams) {
+    scheduleIdleClose()
+    return win
+  }
+
+  closePage()
+  const ses = session.fromPartition(PARTITION)
+  const userAgent = getBrowserUserAgent()
+  ses.setUserAgent(userAgent)
+  installClientHintHeaders(ses, getDeviceProfile())
+  await injectCookies(ses)
+
+  const created = new BrowserWindow({
+    show: false,
+    width: 1440,
+    height: 900,
+    webPreferences: {
+      partition: PARTITION,
+      // 必须关隔离：开着的话 executeJavaScript 跑在隔离世界，用不到页面被 secsdk
+      // 改造过的 fetch，请求会以「用户未登录」失败。配合 nodeIntegration:false，
+      // 页面拿不到 Node，风险限于注入脚本可能被页面 JS 干扰，只读取数据可以接受。
+      contextIsolation: false,
+      nodeIntegration: false,
+      sandbox: false
+    }
+  })
+  created.webContents.setUserAgent(userAgent)
+  applyClientHints(created.webContents, getDeviceProfile(), release())
+  blockCustomProtocols(created)
+
+  // 不 await：抖音个人页是长连接型 SPA，loadURL 常常不 resolve
+  created.loadURL(HOME_URL).catch(() => {})
+  win = created
+
+  try {
+    const sampled = await readBizParams(created)
+    bizParams = sampled.params
+    if (sampled.uifid) pageUifid = sampled.uifid
+    console.log(`[DouyinPage] 页面就绪，采样到 uifid: ${sampled.uifid ? '有' : '无'}`)
+  } catch (error) {
+    closePage()
+    throw error
+  }
+
+  scheduleIdleClose()
+  return created
+}
+
+/**
+ * 在页面里发一次接口请求。
+ *
+ * @param path   接口路径，如 /aweme/v1/web/collects/list/
+ * @param params 业务参数（cursor / count / collects_id 之类），安全参数不要传
+ * @param method listcollection 是 POST，用 GET 会返回 404 Unsupported path(Janus)
+ */
+async function requestInPage(
+  path: string,
+  params: Record<string, string | number>,
+  method: 'GET' | 'POST',
+  body?: Record<string, string | number>
+): Promise<PageResponse> {
+  const target = await ensurePage()
+  const encode = (fields: Record<string, string | number>): string =>
+    Object.entries(fields)
+      .map(([key, value]) => `${key}=${encodeURIComponent(String(value))}`)
+      .join('&')
+  const extra = encode(params)
+  const url = `${path}?${bizParams}${extra ? `&${extra}` : ''}`
+
+  // 签名只覆盖 query，表单 body 不参与，照原样带上即可
+  const headers: Record<string, string> = { Accept: 'application/json, text/plain, */*' }
+  if (body) headers['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
+
+  const script = `
+    (async () => {
+      const response = await fetch(${JSON.stringify(url)}, {
+        method: ${JSON.stringify(method)},
+        credentials: 'include',
+        headers: ${JSON.stringify(headers)},
+        body: ${body ? JSON.stringify(encode(body)) : 'undefined'}
+      })
+      const text = await response.text()
+      let data = null
+      try { data = JSON.parse(text) } catch (error) { data = null }
+      const headers = {}
+      response.headers.forEach((value, key) => { headers[key] = value })
+      return { ok: response.ok, status: response.status, data, text: data ? null : text.slice(0, 200), headers }
+    })()
+  `
+  return (await target.webContents.executeJavaScript(script)) as PageResponse
+}
+
+/** 串行执行，页面一次只处理一个请求 */
+function serialize<T>(task: () => Promise<T>): Promise<T> {
+  const run = queue.then(task, task)
+  // 失败不能让后续任务一起挂掉，所以这里吞掉链上的错误（调用方仍拿得到）
+  queue = run.catch(() => undefined)
+  return run
+}
+
+/**
+ * 取页面请求里的 uifid，必要时先把页面开起来。
+ * 与页面请求共用串行队列，不会和 fetchGuarded 抢 executeJavaScript。
+ */
+export async function getPageUifid(): Promise<string | null> {
+  return serialize(async () => {
+    await ensurePage()
+    return pageUifid
+  })
+}
+
+/**
+ * 请求受 Argus 保护的接口，返回解析后的 JSON。
+ * 拿不到 JSON 或 status_code 非 0 时抛出可读的错误，绝不静默返回空。
+ */
+export async function fetchGuarded(
+  path: string,
+  params: Record<string, string | number> = {},
+  method: 'GET' | 'POST' = 'GET',
+  body?: Record<string, string | number>
+): Promise<Record<string, unknown>> {
+  return serialize(async () => {
+    const response = await requestInPage(path, params, method, body)
+
+    if (!response.data) {
+      console.log('[DouyinPage] 非 JSON 响应:', {
+        path,
+        http: response.status,
+        headers: response.headers,
+        body: response.text || '（空）'
+      })
+      const hint = response.text?.includes('ArgusSecurityPlugin')
+        ? '（接口被抖音安全策略拦截）'
+        : ''
+      throw new Error(`抖音接口返回异常 ${response.status}${hint}：${response.text || '空响应'}`)
+    }
+
+    const statusCode = Number(response.data.status_code ?? 0)
+    if (statusCode !== 0) {
+      const message = String(response.data.status_msg ?? '未知错误')
+      throw new Error(`抖音接口报错 status_code=${statusCode}：${message}`)
+    }
+
+    return response.data
+  })
+}

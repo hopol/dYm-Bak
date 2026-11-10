@@ -1,0 +1,890 @@
+import { ElectronAPI } from '@electron-toolkit/preload'
+import type {
+  AiModelInfo,
+  AiProviderInput,
+  AiProviderView,
+  AnalysisJobItemStatus,
+  AnalysisJobItemView,
+  AnalysisJobView,
+  AnalysisQueueEvent,
+  AnalysisSettings,
+  AsrProviderInput,
+  AsrProviderView,
+  CodexAuthStatus,
+  GrokAuthStatus,
+  OpenCodeCliKey,
+  CreateAnalysisJobInput
+} from '../shared/ai'
+import type { PostAnalysisDetail } from '../shared/analysis'
+import type {
+  MigrationStatus,
+  PrunePreview,
+  StorageConfigInput,
+  StorageConfigView,
+  StorageQueueStats,
+  StorageTestResult
+} from '../shared/storage'
+
+declare global {
+  interface DatabaseAPI {
+    execute: (sql: string, params?: unknown[]) => Promise<unknown>
+    query: <T = unknown>(sql: string, params?: unknown[]) => Promise<T[]>
+    queryOne: <T = unknown>(sql: string, params?: unknown[]) => Promise<T | undefined>
+  }
+
+  interface SettingsAPI {
+    get: (key: string) => Promise<string | null>
+    set: (key: string, value: string) => Promise<void>
+    getAll: () => Promise<Record<string, string>>
+    getDefaultDownloadPath: () => Promise<string>
+  }
+
+  interface CookieAPI {
+    fetchDouyin: () => Promise<string>
+    fetchBilibili: () => Promise<string>
+    fetchKuaishou: () => Promise<string>
+    refreshSilent: () => Promise<string>
+    isRefreshing: () => Promise<boolean>
+    /** 清空登录浏览器分区与已保存的 Cookie，之后需重新登录 */
+    resetBrowser: () => Promise<void>
+  }
+
+  interface UserProfile {
+    nickname: string
+    signature: string
+    avatar: string
+    secUid: string
+    uid: string
+    shortId: string
+    uniqueId: string
+    followingCount: number
+    followerCount: number
+    totalFavorited: number
+    awemeCount: number
+  }
+
+  interface LinkParseResult {
+    type: 'user' | 'video' | 'unknown'
+    id: string
+  }
+
+  interface DouyinAPI {
+    getUserProfile: (url: string) => Promise<UserProfile>
+    getSecUserId: (url: string) => Promise<string>
+    parseUrl: (url: string) => Promise<LinkParseResult>
+  }
+
+  interface DbUser {
+    id: number
+    sec_uid: string
+    uid: string
+    nickname: string
+    signature: string
+    avatar: string
+    avatar_path: string
+    short_id: string
+    unique_id: string
+    following_count: number
+    follower_count: number
+    total_favorited: number
+    aweme_count: number
+    downloaded_count: number
+    homepage_url: string
+    show_in_home: number
+    max_download_count: number
+    remark: string
+    auto_sync: number
+    sync_cron: string
+    last_sync_at: number | null
+    sync_status: 'idle' | 'syncing' | 'error'
+    live_record: number
+    live_check_cron: string
+    live_status: 'idle' | 'recording'
+    last_live_at: number | null
+    platform: string
+    platform_settings: string
+    created_at: number
+    updated_at: number
+  }
+
+  interface UpdateUserSettingsInput {
+    show_in_home?: boolean
+    max_download_count?: number
+    remark?: string
+    auto_sync?: boolean
+    sync_cron?: string
+    live_record?: boolean
+    live_check_cron?: string
+    platform_settings?: import('../shared/platforms').BilibiliCreatorSettings
+  }
+
+  interface AddCreatorOptions {
+    max_download_count?: number
+    show_in_home?: boolean
+    auto_sync?: boolean
+    sync_cron?: string
+    live_record?: boolean
+    live_check_cron?: string
+    platform_settings?: import('../shared/platforms').BilibiliCreatorSettings
+  }
+
+  interface BatchRefreshResult {
+    success: number
+    failed: number
+    details: string[]
+  }
+
+  type AddUserPostDownload =
+    | { status: 'downloading'; awemeId: string }
+    | { status: 'already-downloaded'; awemeId: string }
+    | { status: 'disabled' }
+    | { status: 'unavailable' }
+    | { status: 'not-video-link' }
+
+  interface AddUserResult {
+    user: DbUser
+    isNewUser: boolean
+    postDownload: AddUserPostDownload
+  }
+
+  interface AddPostProgress {
+    awemeId: string
+    nickname: string
+    status: 'success' | 'failed' | 'already-downloaded'
+    error?: string
+  }
+
+  interface UserAPI {
+    getAll: () => Promise<DbUser[]>
+    add: (url: string, options?: AddCreatorOptions) => Promise<AddUserResult>
+    delete: (id: number, deleteFiles?: boolean) => Promise<void>
+    refresh: (id: number) => Promise<DbUser>
+    batchRefresh: (
+      users: { id: number; homepage_url: string; nickname: string }[]
+    ) => Promise<BatchRefreshResult>
+    setShowInHome: (id: number, show: boolean) => Promise<void>
+    updateSettings: (id: number, input: UpdateUserSettingsInput) => Promise<DbUser | undefined>
+    batchUpdateSettings: (
+      ids: number[],
+      input: Omit<UpdateUserSettingsInput, 'remark'>
+    ) => Promise<void>
+    onAddPostProgress: (callback: (progress: AddPostProgress) => void) => () => void
+  }
+
+  interface DbTask {
+    id: number
+    name: string
+    status: 'pending' | 'running' | 'completed' | 'failed'
+    concurrency: number
+    total_videos: number
+    downloaded_videos: number
+    auto_sync: number
+    sync_cron: string
+    last_sync_at: number | null
+    created_at: number
+    updated_at: number
+  }
+
+  interface DbTaskWithUsers extends DbTask {
+    users: DbUser[]
+  }
+
+  interface CreateTaskInput {
+    name: string
+    user_ids: number[]
+    concurrency?: number
+    auto_sync?: boolean
+    sync_cron?: string
+  }
+
+  interface UpdateTaskInput {
+    name?: string
+    status?: string
+    concurrency?: number
+    auto_sync?: boolean
+    sync_cron?: string
+  }
+
+  interface TaskAPI {
+    getAll: () => Promise<DbTaskWithUsers[]>
+    getById: (id: number) => Promise<DbTaskWithUsers | undefined>
+    create: (input: CreateTaskInput) => Promise<DbTaskWithUsers>
+    update: (id: number, input: UpdateTaskInput) => Promise<DbTaskWithUsers | undefined>
+    updateUsers: (taskId: number, userIds: number[]) => Promise<DbTaskWithUsers | undefined>
+    updateSchedule: (taskId: number) => Promise<void>
+    delete: (id: number) => Promise<void>
+  }
+
+  interface DownloadProgress {
+    taskId: number
+    status: 'running' | 'completed' | 'failed'
+    currentUser: string | null
+    currentUserIndex: number
+    totalUsers: number
+    currentVideo: number
+    totalVideos: number
+    message: string
+    downloadedPosts: number
+  }
+
+  interface DownloadAPI {
+    start: (taskId: number) => Promise<void>
+    stop: (taskId: number) => Promise<void>
+    isRunning: (taskId: number) => Promise<boolean>
+    onProgress: (callback: (progress: DownloadProgress) => void) => () => void
+  }
+
+  interface SyncProgress {
+    userId: number
+    status: 'syncing' | 'completed' | 'failed' | 'stopped'
+    nickname: string
+    currentVideo: number
+    totalVideos: number
+    downloadedCount: number
+    skippedCount: number
+    message: string
+  }
+
+  interface SyncAPI {
+    start: (userId: number) => Promise<void>
+    stop: (userId: number) => Promise<void>
+    isRunning: (userId: number) => Promise<boolean>
+    getAnySyncing: () => Promise<number | null>
+    getAllSyncing: () => Promise<number[]>
+    validateCron: (expression: string) => Promise<boolean>
+    updateUserSchedule: (userId: number) => Promise<void>
+    onProgress: (callback: (progress: SyncProgress) => void) => () => void
+  }
+
+  interface SchedulerLog {
+    timestamp: number
+    level: 'info' | 'warn' | 'error'
+    message: string
+    type: 'user' | 'task' | 'system'
+    targetName?: string
+  }
+
+  interface SchedulerAPI {
+    onLog: (callback: (log: SchedulerLog) => void) => () => void
+    getLogs: () => Promise<SchedulerLog[]>
+    clearLogs: () => Promise<void>
+  }
+
+  interface CollectAPI {
+    reschedule: () => Promise<void>
+    syncNow: () => Promise<void>
+  }
+
+  type ScriptHookName = 'post.downloaded' | 'post.analyzed' | 'user.added' | 'live.converted'
+
+  interface ScriptDescriptor {
+    id: string
+    source: 'builtin' | 'external'
+    name: string
+    description: string
+    fileName: string | null
+    filePath: string | null
+    error: string | null
+    hook: ScriptHookName | null
+    hookEnabled: boolean
+    hookWarning: string | null
+    logLimit: number
+    hasLastHookEvent: boolean
+  }
+
+  interface ScriptLogEntry {
+    scriptId: string
+    runId: string
+    seq: number
+    level: 'info' | 'error'
+    message: string
+    time: number
+  }
+
+  interface ScriptRunResult {
+    runId: string
+    ok: boolean
+    result?: unknown
+    error?: string
+    cancelled?: boolean
+    durationMs: number
+  }
+
+  interface ScriptScheduleInfo {
+    scriptId: string
+    cron: string
+    enabled: boolean
+    /** 下次执行时间戳；未启用或表达式无效时为 null */
+    nextRun: number | null
+  }
+
+  interface ScriptsAPI {
+    list: () => Promise<ScriptDescriptor[]>
+    run: (id: string) => Promise<ScriptRunResult>
+    stop: (id: string) => Promise<boolean>
+    running: () => Promise<string[]>
+    getLogs: (id: string) => Promise<ScriptLogEntry[]>
+    clearLogs: (id: string) => Promise<void>
+    getDir: () => Promise<string>
+    openDir: () => Promise<void>
+    read: (id: string) => Promise<string>
+    template: (name: string, hook?: ScriptHookName | null) => Promise<string>
+    create: (fileName: string, source: string) => Promise<ScriptDescriptor>
+    save: (fileName: string, source: string) => Promise<ScriptDescriptor>
+    rename: (from: string, to: string) => Promise<ScriptDescriptor>
+    delete: (fileName: string) => Promise<void>
+    onLog: (callback: (entry: ScriptLogEntry) => void) => () => void
+    onRunningChange: (callback: (ids: string[]) => void) => () => void
+    getSchedules: () => Promise<ScriptScheduleInfo[]>
+    setSchedule: (
+      scriptId: string,
+      cron: string,
+      enabled: boolean
+    ) => Promise<ScriptScheduleInfo | null>
+    setHookEnabled: (scriptId: string, enabled: boolean) => Promise<boolean>
+    setLogLimit: (scriptId: string, limit: number) => Promise<number>
+  }
+
+  interface LiveProgress {
+    userId: number
+    recordId: number | null
+    nickname: string
+    status:
+      | 'checking'
+      | 'not-live'
+      | 'recording'
+      | 'completed'
+      | 'stopped'
+      | 'failed'
+      | 'converting'
+      | 'converted'
+      | 'convert-failed'
+    roomId: string | null
+    title: string | null
+    filePath: string | null
+    message: string
+  }
+
+  interface LiveRecord {
+    id: number
+    user_id: number
+    sec_uid: string
+    nickname: string | null
+    room_id: string
+    title: string | null
+    quality: string | null
+    cover_path: string | null
+    file_path: string | null
+    file_size: number
+    status: 'recording' | 'completed' | 'failed' | 'stopped'
+    error: string | null
+    started_at: number
+    ended_at: number | null
+  }
+
+  // 一条弹幕（t = 相对录制起点的毫秒偏移）
+  interface DanmakuLine {
+    t: number
+    type: 'chat' | 'gift' | 'member'
+    name: string
+    text?: string
+    gift?: string
+    count?: number
+  }
+
+  // 回放准备结果：可原生播放的视频 URL + 展示元信息
+  interface LivePlaybackInfo {
+    videoUrl: string
+    title: string | null
+    nickname: string | null
+    quality: string | null
+    coverPath: string | null
+    filePath: string | null
+  }
+
+  // 批量删除录制记录的结果（录制中 / 转换中的会进 failed）
+  interface DeleteLiveRecordsResult {
+    deleted: number
+    freedBytes: number
+    failed: { id: number; reason: string }[]
+  }
+
+  interface LiveAPI {
+    isRecording: (userId: number) => Promise<boolean>
+    getRecordingUsers: () => Promise<number[]>
+    getConvertingIds: () => Promise<number[]>
+    checkNow: (userId: number) => Promise<boolean>
+    stop: (userId: number) => Promise<boolean>
+    getRecords: (limit?: number) => Promise<LiveRecord[]>
+    preparePlayback: (id: number) => Promise<LivePlaybackInfo>
+    getDanmaku: (id: number) => Promise<DanmakuLine[]>
+    openPlayer: (id: number) => Promise<void>
+    deleteRecord: (id: number, deleteFiles?: boolean) => Promise<DeleteLiveRecordsResult>
+    deleteRecords: (ids: number[], deleteFiles?: boolean) => Promise<DeleteLiveRecordsResult>
+    revealFile: (filePath: string) => Promise<void>
+    updateUserSchedule: (userId: number) => Promise<void>
+    onProgress: (callback: (progress: LiveProgress) => void) => () => void
+  }
+
+  interface DbPost {
+    id: number
+    aweme_id: string
+    user_id: number
+    sec_uid: string
+    nickname: string
+    caption: string
+    desc: string
+    aweme_type: number
+    create_time: string
+    folder_name: string
+    cover_path: string | null
+    video_path: string | null
+    music_path: string | null
+    downloaded_at: number
+    duration?: number | null
+    width?: number | null
+    height?: number | null
+    analysis_tags: string | null
+    analysis_category: string | null
+    analysis_summary: string | null
+    analysis_scene: string | null
+    analysis_content_level: number | null
+    analyzed_at: number | null
+    manual_tags: string | null
+    analysis_raw: string | null
+    analysis_model: string | null
+  }
+
+  interface MediaFiles {
+    type: 'video' | 'images'
+    video?: string
+    images?: string[]
+    imageVideos?: (string | null)[]
+    cover?: string
+    music?: string
+    /** 本地文件总大小（字节）；云端媒体为 undefined */
+    size?: number
+  }
+
+  interface PostAuthor {
+    sec_uid: string
+    nickname: string
+  }
+
+  interface PostFilters {
+    secUid?: string
+    tags?: string[]
+    minContentLevel?: number
+    maxContentLevel?: number
+    analyzedOnly?: boolean
+    keyword?: string
+  }
+
+  type PostSortField = 'create_time' | 'downloaded_at' | 'analyzed_at' | 'analysis_content_level'
+
+  interface PostSortConfig {
+    field: PostSortField
+    order: 'ASC' | 'DESC'
+  }
+
+  interface BrokenPostInfo {
+    postId: number
+    awemeId: string
+    nickname: string
+    folderPath: string
+    reason: string
+  }
+
+  interface PostAPI {
+    getAll: (
+      page?: number,
+      pageSize?: number,
+      filters?: PostFilters,
+      sort?: PostSortConfig
+    ) => Promise<{ posts: DbPost[]; total: number; authors: PostAuthor[] }>
+    getAllTags: () => Promise<string[]>
+    getCoverPath: (secUid: string, folderName: string) => Promise<string | null>
+    getMediaFiles: (
+      secUid: string,
+      folderName: string,
+      awemeType: number
+    ) => Promise<MediaFiles | null>
+    openFolder: (secUid: string, folderName: string) => Promise<void>
+    scanBroken: () => Promise<BrokenPostInfo[]>
+    redownload: (awemeId: string) => Promise<{ success: boolean; message: string }>
+    batchRedownload: (awemeIds: string[]) => Promise<{ success: number; failed: number }>
+  }
+
+  interface UnanalyzedUserCount {
+    sec_uid: string
+    nickname: string
+    count: number
+  }
+
+  interface UserAnalysisStats {
+    sec_uid: string
+    nickname: string
+    total: number
+    analyzed: number
+    unanalyzed: number
+  }
+
+  interface TotalAnalysisStats {
+    total: number
+    analyzed: number
+    unanalyzed: number
+  }
+
+  interface AiAPI {
+    listProviders: () => Promise<AiProviderView[]>
+    /** apiKey 为 undefined 表示不改动已存密钥；空串表示清空 */
+    saveProvider: (input: AiProviderInput) => Promise<AiProviderView>
+    deleteProvider: (id: string) => Promise<void>
+    setDefaultProvider: (id: string) => Promise<void>
+    /** 用表单草稿验证连通性（未保存也可） */
+    verifyProvider: (input: AiProviderInput) => Promise<{ ok: true; message: string }>
+    /** 拉模型列表；协议不支持时为 null */
+    listModels: (input: AiProviderInput) => Promise<AiModelInfo[] | null>
+    codexStatus: (providerId: string) => Promise<CodexAuthStatus>
+    /** 打开浏览器完成 ChatGPT 授权；resolve 时已登录 */
+    codexLogin: (providerId: string) => Promise<CodexAuthStatus>
+    codexCancelLogin: () => Promise<void>
+    codexImportFromCli: (providerId: string) => Promise<CodexAuthStatus>
+    codexLogout: (providerId: string) => Promise<CodexAuthStatus>
+    /** 本机 OpenCode CLI（/connect 保存的）里与地址匹配的 Zen/Go API Key；没有为 null */
+    opencodeCliKey: (baseUrl: string) => Promise<OpenCodeCliKey | null>
+    /** Grok 订阅：浏览器 OAuth 登录，令牌存在该提供方记录里 */
+    grokStatus: (providerId: string) => Promise<GrokAuthStatus>
+    grokLogin: (providerId: string) => Promise<GrokAuthStatus>
+    grokCancelLogin: () => Promise<void>
+    grokLogout: (providerId: string) => Promise<GrokAuthStatus>
+  }
+
+  interface AsrAPI {
+    listProviders: () => Promise<AsrProviderView[]>
+    saveProvider: (input: AsrProviderInput) => Promise<AsrProviderView>
+    deleteProvider: (id: string) => Promise<void>
+    setDefaultProvider: (id: string) => Promise<void>
+    /** 用一小段合成音频验证连通性（未保存也可） */
+    verifyProvider: (input: AsrProviderInput) => Promise<{ ok: true; message: string }>
+  }
+
+  interface AnalysisAPI {
+    getSettings: () => Promise<AnalysisSettings>
+    /** 单条作品的结构化分析、元信息与字幕 */
+    getDetail: (postId: number) => Promise<PostAnalysisDetail>
+    /** 字幕全文检索 */
+    searchTranscripts: (
+      keyword: string,
+      limit?: number
+    ) => Promise<{ postId: number; snippet: string }[]>
+    /** 只更新传入字段；主进程校验范围，非法值抛错 */
+    saveSettings: (patch: Partial<AnalysisSettings>) => Promise<AnalysisSettings>
+    createJob: (input: CreateAnalysisJobInput) => Promise<AnalysisJobView>
+    listJobs: () => Promise<AnalysisJobView[]>
+    getJob: (id: number) => Promise<AnalysisJobView | null>
+    getJobItems: (
+      id: number,
+      filter?: { status?: AnalysisJobItemStatus; page?: number; pageSize?: number }
+    ) => Promise<{ items: AnalysisJobItemView[]; total: number }>
+    pauseJob: (id: number) => Promise<void>
+    resumeJob: (id: number) => Promise<void>
+    cancelJob: (id: number) => Promise<void>
+    /** 失败条目重新排队，返回条数 */
+    retryFailed: (id: number) => Promise<number>
+    deleteJob: (id: number) => Promise<void>
+    getUnanalyzedCount: (secUid?: string) => Promise<number>
+    getUnanalyzedCountByUser: () => Promise<UnanalyzedUserCount[]>
+    getUserStats: () => Promise<UserAnalysisStats[]>
+    getTotalStats: () => Promise<TotalAnalysisStats>
+    /** 队列快照推送（节流）；itemDone 存在时表示刚有一条完成 */
+    onQueue: (callback: (event: AnalysisQueueEvent) => void) => () => void
+  }
+
+  interface TagAliasItem {
+    alias: string
+    tag: string
+  }
+
+  interface TagOverviewStats {
+    totalVideos: number
+    tagged: number
+    untagged: number
+    tagKinds: number
+  }
+
+  interface UserTagStats {
+    sec_uid: string
+    nickname: string
+    avatar: string
+    avatar_path: string
+    total: number
+    tagged: number
+    untagged: number
+  }
+
+  interface TagFrequencyItem {
+    tag: string
+    count: number
+    source: 'ai' | 'manual' | 'both'
+    categories: string[]
+  }
+
+  interface TagLibraryStats {
+    totalTags: number
+    categories: number
+    usedTags: number
+    unusedTags: number
+  }
+
+  interface TagCategoryItem {
+    category: string
+    count: number
+  }
+
+  type TagStatusFilter = 'all' | 'untagged' | 'tagged' | 'ai' | 'manual' | 'both'
+  type TagPostSort = 'downloaded' | 'published' | 'analyzed' | 'level'
+
+  interface TagPostFilters {
+    secUid?: string
+    tags?: string[]
+    tagMode?: 'any' | 'all'
+    keyword?: string
+    status?: TagStatusFilter
+    categories?: string[]
+    scenes?: string[]
+    minLevel?: number
+    maxLevel?: number
+    sort?: TagPostSort
+  }
+
+  interface TagFilterFacets {
+    users: { sec_uid: string; nickname: string; count: number }[]
+    tags: { tag: string; count: number }[]
+    categories: TagCategoryItem[]
+    scenes: { scene: string; count: number }[]
+    statusCounts: Record<Exclude<TagStatusFilter, 'all'>, number>
+    total: number
+  }
+
+  interface TagAPI {
+    getOverviewStats: () => Promise<TagOverviewStats>
+    getUserStats: () => Promise<UserTagStats[]>
+    getLibraryStats: () => Promise<TagLibraryStats>
+    getTagsWithFrequency: (secUid?: string) => Promise<TagFrequencyItem[]>
+    getCategories: () => Promise<TagCategoryItem[]>
+    getFilterFacets: (filters?: TagPostFilters) => Promise<TagFilterFacets>
+    getPost: (postId: number) => Promise<DbPost | undefined>
+    queryPosts: (
+      filters?: TagPostFilters,
+      page?: number,
+      pageSize?: number
+    ) => Promise<{ posts: DbPost[]; total: number }>
+    /** 同筛选条件下的全部作品 id，顺序与 queryPosts 一致；详情页的上/下一条队列用 */
+    queryPostIds: (filters?: TagPostFilters) => Promise<number[]>
+    addTags: (postIds: number[], tags: string[]) => Promise<number>
+    setPostTags: (
+      postId: number,
+      input: { aiTags?: string[]; manualTags?: string[] }
+    ) => Promise<void>
+    clear: (postIds: number[], scope: 'all' | 'ai' | 'manual') => Promise<number>
+    rename: (oldName: string, newName: string) => Promise<number>
+    merge: (names: string[], into: string) => Promise<number>
+    deleteTag: (names: string[]) => Promise<number>
+    addCustomTag: (name: string) => Promise<void>
+    getAliases: () => Promise<TagAliasItem[]>
+    /** 登记别名：以后模型输出 alias 会并到 tag；alias 已是独立标签时等同合并 */
+    addAlias: (alias: string, tag: string) => Promise<void>
+    removeAlias: (alias: string) => Promise<void>
+  }
+
+  interface VideoInfo {
+    awemeId: string
+    desc: string
+    nickname: string
+    coverUrl: string
+    type: 'video' | 'images'
+    videoUrl?: string
+    imageUrls?: string[]
+  }
+
+  interface VideoAPI {
+    getDetail: (url: string) => Promise<VideoInfo>
+    downloadToFolder: (info: VideoInfo) => Promise<void>
+  }
+
+  interface SystemResourceInfo {
+    cpuUsage: number // 0-100
+    memoryUsage: number // 0-100
+    memoryUsed: number // GB
+    memoryTotal: number // GB
+  }
+
+  interface WebServerInfo {
+    started: boolean
+    port: number
+    preferredPort: number
+    origin: string
+    urls: string[]
+  }
+
+  interface PanelRuntimeStatus {
+    embedStarted: boolean
+    port: number
+    host: string
+    urls: string[]
+    adminToken: string
+    agent: 'off' | 'connecting' | 'online' | 'error'
+    agentError: string | null
+  }
+
+  interface PanelAPI {
+    status: () => Promise<PanelRuntimeStatus>
+    apply: () => Promise<PanelRuntimeStatus>
+    issueLocalKey: () => Promise<{ apiKey: string; url: string }>
+  }
+
+  interface SystemAPI {
+    getResourceUsage: () => Promise<SystemResourceInfo>
+    getWebServerInfo: () => Promise<WebServerInfo>
+    openDirectoryDialog: () => Promise<string | null>
+    openDataDirectory: () => Promise<void>
+    openInAppBrowser: (url: string, title?: string) => Promise<void>
+  }
+
+  interface UpdateInfo {
+    version: string
+    releaseDate?: string
+    releaseNotes?: string
+  }
+
+  interface UpdateStatus {
+    status: 'checking' | 'available' | 'not-available' | 'downloading' | 'downloaded' | 'error'
+    info?: UpdateInfo
+    progress?: number
+    error?: string
+  }
+
+  interface UpdaterAPI {
+    check: () => Promise<UpdateInfo | undefined>
+    download: () => Promise<void>
+    install: () => void
+    getCurrentVersion: () => Promise<string>
+    onStatus: (callback: (status: UpdateStatus) => void) => () => void
+  }
+
+  interface MigrationResult {
+    success: number
+    failed: number
+    total: number
+  }
+
+  interface MigrationAPI {
+    execute: (oldPath: string, newPath: string) => Promise<MigrationResult>
+    getCount: (oldPath: string) => Promise<number>
+  }
+
+  interface ClipboardAPI {
+    onDouyinLink: (callback: (link: string) => void) => () => void
+  }
+
+  interface FilesAPI {
+    getUserPosts: (
+      userId: number,
+      page?: number,
+      pageSize?: number,
+      sort?: PostSortConfig
+    ) => Promise<{ posts: DbPost[]; total: number }>
+    fixAllTitles: () => Promise<{
+      success: boolean
+      result?: { fixed: number; skipped: number; failed: number }
+      error?: string
+    }>
+    getFileSizes: (secUid: string) => Promise<{ totalSize: number; folderCount: number }>
+    getPostSize: (secUid: string, folderName: string) => Promise<number>
+    deletePost: (postId: number) => Promise<boolean>
+    deleteUserFiles: (userId: number, secUid: string) => Promise<number>
+  }
+
+  interface DashboardOverview {
+    totalUsers: number
+    totalPosts: number
+    analyzedPosts: number
+    todayDownloads: number
+  }
+
+  interface TrendPoint {
+    date: string
+    count: number
+  }
+
+  interface UserDistItem {
+    nickname: string
+    count: number
+  }
+
+  interface TagStatItem {
+    tag: string
+    count: number
+  }
+
+  interface LevelDistItem {
+    level: number
+    count: number
+  }
+
+  interface DashboardAPI {
+    getOverview: () => Promise<DashboardOverview>
+    getDownloadTrend: (days?: number) => Promise<TrendPoint[]>
+    getUserDistribution: (limit?: number) => Promise<UserDistItem[]>
+    getTopTags: (limit?: number) => Promise<TagStatItem[]>
+    getContentLevelDistribution: () => Promise<LevelDistItem[]>
+  }
+
+  interface StorageAPI {
+    getConfig: () => Promise<StorageConfigView>
+    saveConfig: (input: StorageConfigInput) => Promise<StorageConfigView>
+    test: () => Promise<StorageTestResult>
+    getStats: () => Promise<StorageQueueStats>
+    enqueueAll: () => Promise<number>
+    retryFailed: () => Promise<number>
+    getMigrationStatus: () => Promise<MigrationStatus>
+    startVerify: () => Promise<void>
+    previewPrune: (fraction: number) => Promise<PrunePreview>
+    startPrune: (fraction: number) => Promise<void>
+  }
+
+  interface API {
+    db: DatabaseAPI
+    settings: SettingsAPI
+    cookie: CookieAPI
+    douyin: DouyinAPI
+    user: UserAPI
+    task: TaskAPI
+    download: DownloadAPI
+    sync: SyncAPI
+    scheduler: SchedulerAPI
+    collect: CollectAPI
+    live: LiveAPI
+    post: PostAPI
+    ai: AiAPI
+    asr: AsrAPI
+    analysis: AnalysisAPI
+    tag: TagAPI
+    video: VideoAPI
+    system: SystemAPI
+    updater: UpdaterAPI
+    migration: MigrationAPI
+    clipboard: ClipboardAPI
+    files: FilesAPI
+    dashboard: DashboardAPI
+    scripts: ScriptsAPI
+    storage: StorageAPI
+    panel: PanelAPI
+  }
+
+  interface Window {
+    electron: ElectronAPI
+    api: API
+  }
+}

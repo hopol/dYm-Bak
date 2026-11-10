@@ -1,0 +1,66 @@
+appId: dev.everless.dym
+productName: dYm
+directories:
+  buildResources: build
+extraResources:
+  - from: resources/web
+    to: web
+  - from: src/panel/public
+    to: panel
+  - from: resources/ffmpeg
+    to: ffmpeg
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
+  - '!{.env,.env.*,.npmrc}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  # 文档站源码、产物与 Cloudflare 部署配置都不属于桌面端运行时
+  - '!docs'
+  # 单独部署的 Next 管理端不属于桌面端安装包
+  - '!panel'
+  # ffmpeg 已通过 extraResources 单独打包，排除出 asar 避免重复打一份（省 ~130MB）
+  - '!resources/ffmpeg'
+  # CI 把 electron / electron-builder 的下载缓存放在工作区 .cache 下，不排除会整个打进 asar（约 140MB）
+  - '!.cache'
+  # 运行时用不到：source map，以及 better-sqlite3 编译用的 C 源码（已编译成 build/Release 下的 .node）
+  - '!**/*.map'
+  - '!node_modules/better-sqlite3/{deps,src}'
+asarUnpack:
+  - resources/**
+win:
+  executableName: dym
+  forceCodeSigning: false
+nsis:
+  artifactName: ${name}-${version}-setup.${ext}
+  shortcutName: ${productName}
+  uninstallDisplayName: ${productName}
+  createDesktopShortcut: always
+mac:
+  # 显式带上 ${arch}：默认模板对 x64 会省略架构，产出 dYm-x.y.z-mac.zip，
+  # 从 Release 页面手动下载的人会以为那是通用包。arm64 的文件名不受影响，
+  # 仍是 dYm-x.y.z-arm64-mac.zip——electron-updater 靠 arm64 子串分流，
+  # 加上 x64 不含该子串，自动更新的判定不变。
+  artifactName: ${productName}-${version}-${arch}-mac.${ext}
+  identity: null
+  entitlementsInherit: build/entitlements.mac.plist
+  extendInfo:
+    - NSCameraUsageDescription: Application requests access to the device's camera.
+    - NSMicrophoneUsageDescription: Application requests access to the device's microphone.
+    - NSDocumentsFolderUsageDescription: Application requests access to the user's Documents folder.
+    - NSDownloadsFolderUsageDescription: Application requests access to the user's Downloads folder.
+  notarize: false
+dmg:
+  # 必须带 ${arch}：arm64 与 x64 的 dmg 会被 release 作业下载进同一个目录，
+  # 模板里不区分架构的话两者同名，后到的会静默覆盖先到的
+  artifactName: ${name}-${version}-${arch}.${ext}
+linux:
+  target:
+    - AppImage
+    - deb
+  maintainer: electronjs.org
+  category: Utility
+appImage:
+  artifactName: ${name}-${version}.${ext}
+npmRebuild: false
