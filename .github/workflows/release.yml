@@ -1,0 +1,78 @@
+name: 镜像上游发布
+
+on:
+  schedule:
+    - cron: '37 2 */5 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dym-bak-release-mirror
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: Everless321/dYm
+
+jobs:
+  mirror-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 获取上游最新 Release
+        id: upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          json="$(gh api "repos/${UPSTREAM_REPO}/releases/latest")"
+          tag="$(jq -r '.tag_name' <<<"$json")"
+          [[ -n "$tag" && "$tag" != "null" ]] || { echo "未获得有效的上游发布标签。" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "name=$(jq -r '.name // .tag_name' <<<"$json")" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$(jq -r '.prerelease' <<<"$json")" >> "$GITHUB_OUTPUT"
+          echo "asset_count=$(jq -r '.assets | length' <<<"$json")" >> "$GITHUB_OUTPUT"
+      - name: 检查是否已经镜像
+        id: exists
+        shell: bash
+        run: |
+          tag="mirror-release-${{ steps.upstream.outputs.tag }}"
+          git rev-parse -q --verify "refs/tags/$tag" >/dev/null && echo "exists=true" >> "$GITHUB_OUTPUT" || echo "exists=false" >> "$GITHUB_OUTPUT"
+      - name: 下载上游附件
+        if: steps.exists.outputs.exists != 'true' && steps.upstream.outputs.asset_count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-assets
+          gh release download "${{ steps.upstream.outputs.tag }}" --repo "$UPSTREAM_REPO" --dir release-assets
+      - name: 创建镜像 Release
+        if: steps.exists.outputs.exists != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upstream_tag="${{ steps.upstream.outputs.tag }}"
+          mirror_tag="mirror-release-${upstream_tag}"
+          notes="$(mktemp)"
+          cat > "$notes" <<EOF
+          # dYm-Bak 上游发布镜像
+
+          - 上游仓库：https://github.com/${UPSTREAM_REPO}
+          - 上游发布：[${upstream_tag}](https://github.com/${UPSTREAM_REPO}/releases/tag/${upstream_tag})
+          - 镜像时间（UTC）：$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          本 Release 的附件直接下载自上游，未在本镜像仓库重新构建、修改或签名。
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$mirror_tag" -m "Mirror dYm-Bak release $upstream_tag"
+          git push origin "$mirror_tag"
+          args=(release create "$mirror_tag" --title "dYm-Bak 镜像 ${{ steps.upstream.outputs.name }}" --notes-file "$notes")
+          [[ "${{ steps.upstream.outputs.prerelease }}" == "true" ]] && args+=(--prerelease)
+          compgen -G 'release-assets/*' >/dev/null && args+=(release-assets/*)
+          gh "${args[@]}"

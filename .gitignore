@@ -1,0 +1,17 @@
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 编辑器配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志
+*.log
+
+# Release 镜像临时下载目录
+release-assets/
